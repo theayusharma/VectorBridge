@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import docx
-import google.genai as genai
+import google.generativeai as genai
 import httpx
 import pdfplumber
 import textract
@@ -28,7 +28,7 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from geminiloadbalance import get_next_api_key
 
-client = genai.Client(api_key=get_next_api_key())
+
 
 
 logging.basicConfig(
@@ -350,6 +350,8 @@ def create_vector_store(chunks: List[str]) -> FAISS:
 
 # LLM
 async def generate_answer_with_llm(question: str, context: str) -> str:
+    genai.configure(api_key=get_next_api_key())
+
     prompt = f"""
     Role: You are an expert insurance policy analyst specialized in health insurance policies. Your task is to extract precise information from policy documents and answer questions with exact details including numbers, conditions, and limitations.
 
@@ -387,7 +389,7 @@ async def generate_answer_with_llm(question: str, context: str) -> str:
 
     logger.info(f"Generating answer for question: {question[:50]}...")
     try:
-        model = client.GenerativeModel(Config.GEMINI_MODEL)
+        model = genai.GenerativeModel(Config.GEMINI_MODEL)
         response = await model.generate_content_async(prompt)
         return response.text.strip()
     except Exception as e:
