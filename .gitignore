@@ -2,3 +2,4 @@
 models/
 .venv/
 __src/pycache.pyc__
+api_logs.txt
