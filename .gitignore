@@ -3,3 +3,5 @@ models/
 .venv/
 __src/pycache.pyc__
 api_logs.txt
+api_hit_count.txt
+

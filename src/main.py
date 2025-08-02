@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import re
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
@@ -47,6 +48,9 @@ class Config:
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
     EMBEDDING_MODEL_PATH = "./models/all-MiniLM-L6-v2"
     GEMINI_MODEL = "gemini-1.5-flash"
+    CACHE_DIR = Path("cache")
+    DOCUMENT_CACHE_DIR = CACHE_DIR / "document"
+    VECTORDB_CACHE_DIR = CACHE_DIR / "vectordb"
 
 API_HIT_COUNT = 0
 API_COUNT_FILE = "api_hit_count.txt"
@@ -93,6 +97,9 @@ async def lifespan(app: FastAPI):
         model_name=Config.EMBEDDING_MODEL,
         cache_folder=Config.EMBEDDING_MODEL_PATH
     )
+    # Create cache directories if they don't exist
+    Config.DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    Config.VECTORDB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     yield
     # Clean up resources if needed on shutdown
     logger.info("Shutting down...")
@@ -373,14 +380,18 @@ def clean_and_chunk_text(
     return chunks
 
 
+# Caching
+def get_document_hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
 # vector store
-def create_vector_store(chunks: List[str]) -> FAISS:
+def create_vector_store(chunks: List[str], embeddings: SentenceTransformerEmbeddings) -> FAISS:
     if not chunks:
         raise ValueError("Cannot create vector store from empty text chunks")
 
     logger.info(f"Creating vector store with {len(chunks)} chunks")
     try:
-        vector_store = FAISS.from_texts(texts=chunks, embedding=app.state.embeddings)
+        vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
         return vector_store
     except Exception as e:
         logger.error(f"Failed to create vector store: {str(e)}")
@@ -482,25 +493,47 @@ async def hackrx_run(
     start_time = asyncio.get_event_loop().time()
 
     try:
-        content, file_ext = await get_document_content_from_url(req.documents)
-        parser = PARSER_MAPPING.get(file_ext)
-        if not parser:
-            raise HTTPException(
-                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-                detail=f"File type '{file_ext}' not supported",
+        content_bytes, file_ext = await get_document_content_from_url(req.documents)
+        doc_hash = get_document_hash(content_bytes.getvalue())
+        
+        vector_store_path = Config.VECTORDB_CACHE_DIR / f"{doc_hash}.faiss"
+        
+        if vector_store_path.exists():
+            logger.info(f"Loading vector store from cache: {vector_store_path}")
+            vector_store = FAISS.load_local(
+                folder_path=str(Config.VECTORDB_CACHE_DIR),
+                index_name=doc_hash,
+                embeddings=app.state.embeddings,
+                allow_dangerous_deserialization=True
+            )
+            metadata = {"source": "cache"}
+        else:
+            logger.info("Processing new document.")
+            parser = PARSER_MAPPING.get(file_ext)
+            if not parser:
+                raise HTTPException(
+                    status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                    detail=f"File type '{file_ext}' not supported",
+                )
+
+            raw_text, metadata = await asyncio.get_event_loop().run_in_executor(
+                None, parser, io.BytesIO(content_bytes.getvalue())
             )
 
-        raw_text, metadata = await asyncio.get_event_loop().run_in_executor(
-            None, parser, content
-        )
+            text_chunks = clean_and_chunk_text(
+                raw_text, chunk_size=req.chunk_size, chunk_overlap=req.chunk_overlap
+            )
 
-        text_chunks = clean_and_chunk_text(
-            raw_text, chunk_size=req.chunk_size, chunk_overlap=req.chunk_overlap
-        )
+            vector_store = await asyncio.get_event_loop().run_in_executor(
+                None, create_vector_store, text_chunks, app.state.embeddings
+            )
+            
+            # Save to cache
+            vector_store.save_local(folder_path=str(Config.VECTORDB_CACHE_DIR), index_name=doc_hash)
+            with open(Config.DOCUMENT_CACHE_DIR / doc_hash, "wb") as f:
+                f.write(content_bytes.getvalue())
+            logger.info(f"Saved new document and vector store to cache with hash: {doc_hash}")
 
-        vector_store = await asyncio.get_event_loop().run_in_executor(
-            None, create_vector_store, text_chunks
-        )
 
         answers = await process_questions_parallel(
             req.questions, vector_store, req.top_k
