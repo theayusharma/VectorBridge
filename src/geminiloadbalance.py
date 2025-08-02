@@ -5,14 +5,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[
-        logging.FileHandler("api_logs.txt"),
-        logging.StreamHandler()
-    ]
-)
 logger = logging.getLogger(__name__)
 
 API_KEYS = os.getenv("GEMINI_API_KEYS", "").split(",")

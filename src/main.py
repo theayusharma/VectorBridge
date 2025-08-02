@@ -49,23 +49,41 @@ class Config:
     GEMINI_MODEL = "gemini-1.5-flash"
 
 API_HIT_COUNT = 0
+API_COUNT_FILE = "api_hit_count.txt"
 API_LOG_FILE = "api_logs.txt"
 
 def load_api_hit_count():
     global API_HIT_COUNT
     try:
-        with open(API_LOG_FILE, "r") as f:
-            for line in f:
-                if "API hit count" in line:
-                    API_HIT_COUNT = int(line.split(":")[-1].strip())
-                    logger.info(f"Loaded API hit count: {API_HIT_COUNT}")
-    except FileNotFoundError:
-        logger.info("api_logs.txt not found, starting hit count from 0")
+        with open(API_COUNT_FILE, "r") as f:
+            API_HIT_COUNT = int(f.read().strip())
+            logger.info(f"Loaded API hit count: {API_HIT_COUNT}")
+    except (FileNotFoundError, ValueError):
+        logger.info("api_hit_count.txt not found or invalid, starting hit count from 0")
         API_HIT_COUNT = 0
 
 def save_api_hit_count():
-    with open(API_LOG_FILE, "a") as f:
-        f.write(f"API hit count: {API_HIT_COUNT}\n")
+    with open(API_COUNT_FILE, "w") as f:
+        f.write(str(API_HIT_COUNT))
+
+
+def manage_log_file():
+    if not os.path.exists(API_LOG_FILE):
+        return
+
+    # Check if file size exceeds 10MB
+    if os.path.getsize(API_LOG_FILE) > 10 * 1024 * 1024:
+        logger.info("api_logs.txt exceeds 10MB, trimming...")
+        with open(API_LOG_FILE, "r") as f:
+            lines = f.readlines()
+        
+        # Keep the last 50 lines
+        if len(lines) > 50:
+            with open(API_LOG_FILE, "w") as f:
+                f.writelines(lines[-50:])
+            logger.info("api_logs.txt trimmed, keeping the last 50 lines.")
+
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
