@@ -13,4 +13,4 @@ COPY . .
 ENV PORT=8080
 EXPOSE $PORT
 
-CMD ["uv", "run", "src/main.py"]
+CMD ["uv", "src/main.py", "--host", "0.0.0.0", "--port", "${PORT}", "--proxy-headers"]

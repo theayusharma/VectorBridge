@@ -1,39 +1,94 @@
+import asyncio
+import email
 import io
+import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List
-
-from dotenv import load_dotenv
-
-load_dotenv()
-
-
-import email
+from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import docx
 import google.generativeai as genai
 import httpx
 import pdfplumber
-from fastapi import FastAPI, HTTPException, Security, status
+import textract
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, Request, Security, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import FAISS
-from pydantic import BaseModel
-import textract
+from pydantic import BaseModel, Field, HttpUrl
 
-API_KEY = os.getenv("HACKRX_AUTH_TOKEN")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+
+class Config:
+    MAX_FILE_SIZE = 25 * 1024 * 1024  # 25MB
+    REQUEST_TIMEOUT = 30.0
+    CHUNK_SIZE = 1000
+    CHUNK_OVERLAP = 200
+    TOP_K_CHUNKS = 3
+    EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    GEMINI_MODEL = "gemini-1.5-flash"
+
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-
 if not GEMINI_API_KEY:
-    raise RuntimeError("missing env var: GEMINI_API_KEY")
+    raise RuntimeError("Missing environment variable: GEMINI_API_KEY")
 genai.configure(api_key=GEMINI_API_KEY)
 
 # FastAPI app
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
-app = FastAPI(title="HackRx RAG by LetsGoo...", version="0.1.0")
+app = FastAPI(title="HackRx RAG API", version="0.2.0")
+
+app.add_middleware(HTTPSRedirectMiddleware)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# custom exceptions
+class DocumentProcessingError(Exception):
+    pass
+
+class LLMGenerationError(Exception):
+    pass
+
+
+# exception handlers
+@app.exception_handler(DocumentProcessingError)
+async def document_processing_exception_handler(
+    request: Request, exc: DocumentProcessingError
+):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={"detail": str(exc)},
+    )
+
+@app.exception_handler(LLMGenerationError)
+async def llm_generation_exception_handler(request: Request, exc: LLMGenerationError):
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": str(exc)},
+    )
 
 
 # auth check
@@ -52,7 +107,7 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
         )
 
     token = parts[1]
-    if token != API_KEY:
+    if token != os.getenv("HACKRX_AUTH_TOKEN"):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid Bearer token",
@@ -60,232 +115,348 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
     return token
 
 
-# data models
+# Data models
 class HackRxRequest(BaseModel):
-    documents: str
+    documents: HttpUrl
     questions: List[str]
+
+    chunk_size: Optional[int] = Field(
+        default=Config.CHUNK_SIZE,
+        ge=100,
+        le=2000,
+        description="Size of text chunks for processing",
+    )
+    chunk_overlap: Optional[int] = Field(
+        default=Config.CHUNK_OVERLAP,
+        ge=0,
+        le=500,
+        description="Overlap between text chunks",
+    )
+    top_k: Optional[int] = Field(
+        default=Config.TOP_K_CHUNKS,
+        ge=1,
+        le=10,
+        description="Number of relevant chunks to retrieve",
+    )
 
 class HackRxResponse(BaseModel):
     answers: List[str]
+    processing_time: float
+    document_metadata: Optional[Dict[str, Any]]
 
 
-# parsers
-def parse_pdf(content: io.BytesIO) -> str:
+# Parsers
+def parse_pdf(content: io.BytesIO) -> Tuple[str, Dict[str, Any]]:
     full_text = []
-    with pdfplumber.open(content) as pdf:
-        for i, page in enumerate(pdf.pages):
-            page_text = page.extract_text(x_tolerance=2) or ""
-            full_text.append(f"--- Page {i+1} ---\n{page_text}")
+    metadata = {"pages": 0, "tables": 0, "images": 0}
 
-            tables = page.extract_tables()
-            if tables:
-                full_text.append(f"\n--- Tables on Page {i+1} ---\n")
-                for table in tables:
-                    markdown_table = "\n".join(
-                        [
-                            "| " + " | ".join(map(str, row)) + " |"
-                            for row in table
-                            if row
-                        ]
-                    )
-                    full_text.append(markdown_table + "\n")
-    return "\n".join(full_text)
-
-
-def parse_docx(content: io.BytesIO) -> str:
-    doc = docx.Document(content)
-    return "\n".join([para.text for para in doc.paragraphs])
-
-
-def parse_doc(content: io.BytesIO) -> str:
-    temp_file_path = "temp_file.doc"
-    with open(temp_file_path, "wb") as f:
-        f.write(content.read())
     try:
+        with pdfplumber.open(content) as pdf:
+            metadata["pages"] = len(pdf.pages)
+            for i, page in enumerate(pdf.pages):
+                page_text = page.extract_text(x_tolerance=2) or ""
+                full_text.append(f"--- Page {i+1} ---\n{page_text}")
+
+                tables = page.extract_tables()
+                if tables:
+                    metadata["tables"] += len(tables)
+                    full_text.append(f"\n--- Tables on Page {i+1} ---\n")
+                    for table in tables:
+                        markdown_table = "\n".join(
+                            [
+                                "| " + " | ".join(map(str, row)) + " |"
+                                for row in table
+                                if row
+                            ]
+                        )
+                        full_text.append(markdown_table + "\n")
+
+                if page.images:
+                    metadata["images"] += len(page.images)
+    except Exception as e:
+        raise DocumentProcessingError(f"Failed to parse PDF: {str(e)}")
+
+    return "\n".join(full_text), metadata
+
+
+def parse_docx(content: io.BytesIO) -> Tuple[str, Dict[str, Any]]:
+    try:
+        doc = docx.Document(content)
+        metadata = {
+            "paragraphs": len(doc.paragraphs),
+            "tables": len(doc.tables),
+            "sections": len(doc.sections),
+        }
+        return "\n".join([para.text for para in doc.paragraphs if para.text]), metadata
+    except Exception as e:
+        raise DocumentProcessingError(f"Failed to parse DOCX: {str(e)}")
+
+
+def parse_doc(content: io.BytesIO) -> Tuple[str, Dict[str, Any]]:
+    temp_file_path = "temp_file.doc"
+    try:
+        with open(temp_file_path, "wb") as f:
+            f.write(content.read())
+
         text = textract.process(temp_file_path).decode("utf-8")
+        return text, {"format": "DOC"}
+    except Exception as e:
+        raise DocumentProcessingError(f"Failed to parse DOC: {str(e)}")
     finally:
-        os.remove(temp_file_path)
-    return text
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
 
 
-def parse_eml(content: io.BytesIO) -> str:
-    msg = email.message_from_bytes(content.read())
-    body = ""
-    if msg.is_multipart():
-        for part in msg.walk():
-            ctype = part.get_content_type()
-            if ctype == "text/plain":
-                body = part.get_payload(decode=True).decode(errors="ignore")
-                break
-    else:
-        body = msg.get_payload(decode=True).decode(errors="ignore")
-    return f"Subject: {msg['subject']}\nFrom: {msg['from']}\nTo: {msg['to']}\n\n{body}"
+def parse_eml(content: io.BytesIO) -> Tuple[str, Dict[str, Any]]:
+    try:
+        msg = email.message_from_bytes(content.read())
+        metadata = {
+            "subject": msg["subject"],
+            "from": msg["from"],
+            "to": msg["to"],
+            "date": msg["date"],
+            "content_type": msg.get_content_type(),
+        }
+
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ctype = part.get_content_type()
+                if ctype == "text/plain":
+                    body = part.get_payload(decode=True).decode(errors="ignore")
+                    break
+        else:
+            body = msg.get_payload(decode=True).decode(errors="ignore")
+
+        return (
+            f"Subject: {msg['subject']}\nFrom: {msg['from']}\nTo: {msg['to']}\n\n{body}",
+            metadata,
+        )
+    except Exception as e:
+        raise DocumentProcessingError(f"Failed to parse EML: {str(e)}")
 
 
-# parsing functions mapping
+def parse_txt(content: io.BytesIO) -> Tuple[str, Dict[str, Any]]:
+    try:
+        text = content.read().decode("utf-8", errors="ignore")
+        return text, {"size": len(text)}
+    except Exception as e:
+        raise DocumentProcessingError(f"Failed to parse TXT: {str(e)}")
+
+
+# parser mapping
 PARSER_MAPPING: Dict[str, callable] = {
     ".pdf": parse_pdf,
     ".docx": parse_docx,
     ".doc": parse_doc,
     ".eml": parse_eml,
-    ".txt": lambda c: c.read().decode("utf-8", errors="ignore"),
+    ".txt": parse_txt,
 }
 
 
-# get document via url
-async def get_document_content_from_url(url: str) -> (io.BytesIO, str):
-    print(f"E1: Downloading document from {url}")
+# doc downloader
+async def get_document_content_from_url(url: Union[str, HttpUrl]) -> Tuple[io.BytesIO, str]:
+    logger.info(f"Downloading document from {url}")
+    
+    url_str = str(url) if isinstance(url, HttpUrl) else url
+    
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(url, follow_redirects=True, timeout=30.0)
+        async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
+            head_response = await client.head(url_str, follow_redirects=True)
+            head_response.raise_for_status()
+            
+            content_length = head_response.headers.get("content-length")
+            if content_length and int(content_length) > Config.MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB"
+                )
+            
+            response = await client.get(url_str, follow_redirects=True)
             response.raise_for_status()
-            file_ext = Path(urlparse(url).path).suffix.lower() or ".txt"
-            return io.BytesIO(await response.aread()), file_ext
+            
+            file_ext = Path(urlparse(url_str).path).suffix.lower()
+            if not file_ext or file_ext not in PARSER_MAPPING:
+                file_ext = ".txt"
+            
+            content = io.BytesIO(await response.aread())
+            if content.getbuffer().nbytes > Config.MAX_FILE_SIZE:
+                raise HTTPException(
+                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                    detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB"
+                )
+            
+            return content, file_ext
     except httpx.RequestError as e:
+        logger.error(f"Failed to download document: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to download or access URL: {e}",
+            detail=f"Failed to download document: {str(e)}",
         )
 
 
-# cleaning & chunking
-def clean_and_chunk_text(raw_text: str) -> List[str]:
-    print("E3: Starting text cleaning and chunking...")
+# text processing
+def clean_and_chunk_text(
+    raw_text: str,
+    chunk_size: int = Config.CHUNK_SIZE,
+    chunk_overlap: int = Config.CHUNK_OVERLAP,
+) -> List[str]:
+    logger.info("Processing and chunking text")
+
     cleaned_text = re.sub(r"\n{3,}", "\n\n", raw_text).strip()
     cleaned_text = re.sub(r"[ \t]{2,}", " ", cleaned_text)
 
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
         length_function=len,
     )
     chunks = text_splitter.split_text(cleaned_text)
-    print(f"Text successfully cleaned and split into {len(chunks)} chunks.")
+
+    if not chunks:
+        raise DocumentProcessingError(
+            "Could not extract meaningful text chunks from document"
+        )
+
+    logger.info(f"Split text into {len(chunks)} chunks")
     return chunks
 
 
-# put embeddings & store into db
+# vector store
 def create_vector_store(chunks: List[str]) -> FAISS:
     if not chunks:
-        raise ValueError(
-            "Cannot create vector store from an empty list of text chunks."
-        )
+        raise ValueError("Cannot create vector store from empty text chunks")
 
-    embedding_model = "all-MiniLM-L6-v2"
-    print(f"E4: Initializing sentence-transformer embedding model {embedding_model}...")
-    embeddings = SentenceTransformerEmbeddings(model_name=embedding_model)
-
-    print("E5: Generating embeddings and creating FAISS vector store...")
-    vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
-    print("done: doc processed")
-    return vector_store
+    logger.info(f"Creating vector store with {len(chunks)} chunks")
+    try:
+        embeddings = SentenceTransformerEmbeddings(model_name=Config.EMBEDDING_MODEL)
+        vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
+        return vector_store
+    except Exception as e:
+        logger.error(f"Failed to create vector store: {str(e)}")
+        raise DocumentProcessingError("Failed to generate document embeddings")
 
 
-def process_and_expand_query(
-    question: str, embeddings: SentenceTransformerEmbeddings
-) -> List[float]:
-    # F2: Query Expansion (Simple placeholder version)
-    # In a more advanced system, you would use an LLM to generate multiple variations.
-    # For now, we will just use the original question as it's very effective.
-    print(f"F2: Processing query: '{question}'")
-    # expanded_queries = [question, f"explain in detail {question}"] # Example of simple expansion
-
-    # F3: Generate Query Embedding
-    # We use the same embedding model to embed the user's query.
-    print("F3: Generating embedding for the query...")
-    # LangChain's vector store search methods handle this automatically,
-    # but we can do it explicitly to see the step.
-    # The search function is more efficient, so we'll let it handle the embedding.
-    # query_embedding = embeddings.embed_query(question)
-    # print("Query embedding generated.")
-    # For simplicity and efficiency, we will pass the raw text to the search function.
-    return question
-
-
-# semantic search
-def retrieve_relevant_chunks(
-    question: str, vector_store: FAISS, k: int = 3
-) -> List[Any]:
-    print(f"\nG/H: Retrieving top-{k} chunks for question: '{question}'")
-    # The `similarity_search` method performs the following:
-    # 1. Accepts the raw query string (our processed question).
-    # 2. Implicitly performs step F3 (Generate Query Embedding) using the store's embedding function.
-    # 3. Performs step G (Semantic Search) to find the most similar vectors in the FAISS index.
-    # 4. Performs step H (Retrieve Top-K Chunks).
-    relevant_docs = vector_store.similarity_search(question, k=k)
-    print(f"Found {len(relevant_docs)} relevant document chunks.")
-    return relevant_docs
-
-
-async def generate_decision_with_llm(question: str, context: str) -> str:
+# LLM
+async def generate_answer_with_llm(question: str, context: str) -> str:
     prompt = f"""
-    You are a helpful assistant. Based *only* on the context provided below, answer the following question concisely.
-    Do not use any external knowledge or make assumptions. If the answer is not found in the context,
-    clearly state that "The answer could not be found in the provided document."
+    You are a helpful assistant that answers questions based strictly on the provided context.
+    Follow these guidelines:
+    1. Be concise and factual
+    2. Only use information from the provided context
+    3. If the answer isn't in the context, say "The answer could not be found in the document"
+    4. Format lists and important points clearly
 
-    **Context:**
+    Context:
     ---
     {context}
     ---
 
-    **Question:** {question}
+    Question: {question}
 
-    **Answer:**
+    Answer:
     """
 
-    print("I1: Prompt constructed. Calling Gemini API...")
-
+    logger.info(f"Generating answer for question: {question[:50]}...")
     try:
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel(Config.GEMINI_MODEL)
         response = await model.generate_content_async(prompt)
-
-        answer = response.text.strip()
-        print("I3: Received and parsed response from Gemini.")
-        return answer
+        return response.text.strip()
     except Exception as e:
-        print(f"Error calling Gemini API: {e}")
-        return f"An error occurred while communicating with the AI model. Please check the server logs."
+        logger.error(f"LLM generation failed: {str(e)}")
+        raise LLMGenerationError("Failed to generate answer from document")
 
 
-# api endpoint
-@app.get("/")
-def hola():
-    return "LetsGooooooo, its up ye.........."
+# process questions in parallel
+async def process_questions_parallel(
+    questions: List[str], vector_store: FAISS, top_k: int
+) -> List[str]:
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor() as executor:
+        tasks = []
+        for question in questions:
+            relevant_docs = await loop.run_in_executor(
+                executor, partial(vector_store.similarity_search, question, k=top_k)
+            )
+            context = "\n---\n".join([doc.page_content for doc in relevant_docs])
+
+            tasks.append(generate_answer_with_llm(question, context))
+
+        return await asyncio.gather(*tasks)
+
+
+# API endpoints
+@app.get("/", include_in_schema=False)
+async def root():
+    return {"message": "Letsgoo, its up running........"}
+
 
 @app.post(
     "/api/v1/hackrx/run",
     response_model=HackRxResponse,
+    responses={
+        200: {"description": "Successful response"},
+        400: {"description": "Invalid input or document processing error"},
+        401: {"description": "Unauthorized"},
+        413: {"description": "Document too large"},
+        422: {"description": "Unprocessable document"},
+        503: {"description": "LLM service unavailable"},
+    },
 )
-async def hackrx_run(req: HackRxRequest, api_key: str = Security(get_api_key)):
-    # doc processing
-    content_bytes, file_ext = await get_document_content_from_url(req.documents)
-    parser = PARSER_MAPPING.get(file_ext)
-    if not parser:
-        raise HTTPException(415, f"File type '{file_ext}' not supported.")
-    raw_text = parser(content_bytes)
-    text_chunks = clean_and_chunk_text(raw_text)
-    if not text_chunks:
-        raise HTTPException(400, "Could not extract text from document.")
-    vector_store = create_vector_store(text_chunks)
+async def hackrx_run(
+    req: HackRxRequest, api_key: str = Security(get_api_key)
+) -> HackRxResponse:
+    start_time = asyncio.get_event_loop().time()
 
-    # query processing
-    final_answers = []
-    for question in req.questions:
-        relevant_chunks = retrieve_relevant_chunks(question, vector_store)
-        context = "\n---\n".join([doc.page_content for doc in relevant_chunks])
+    try:
+        content, file_ext = await get_document_content_from_url(req.documents)
+        parser = PARSER_MAPPING.get(file_ext)
+        if not parser:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail=f"File type '{file_ext}' not supported",
+            )
 
-        if not context:
-            answer_text = "Could not find any relevant information in the document to answer this question."
-        else:
-            answer_text = await generate_decision_with_llm(question, context)
+        raw_text, metadata = await asyncio.get_event_loop().run_in_executor(
+            None, parser, content
+        )
 
-        final_answers.append(answer_text)
+        text_chunks = clean_and_chunk_text(
+            raw_text, chunk_size=req.chunk_size, chunk_overlap=req.chunk_overlap
+        )
 
-    return HackRxResponse(answers=final_answers)
+        vector_store = await asyncio.get_event_loop().run_in_executor(
+            None, create_vector_store, text_chunks
+        )
+
+        answers = await process_questions_parallel(
+            req.questions, vector_store, req.top_k
+        )
+
+        processing_time = asyncio.get_event_loop().time() - start_time
+
+        return HackRxResponse(
+            answers=answers,
+            processing_time=round(processing_time, 2),
+            document_metadata=metadata,
+        )
+
+    except HTTPException:
+        raise
+    except DocumentProcessingError as e:
+        raise
+    except LLMGenerationError as e:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An unexpected error occurred",
+        )
 
 
 # server
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+    uvicorn.run(app, host="0.0.0.0", port=8080, timeout_keep_alive=60, log_config=None)
