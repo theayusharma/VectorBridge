@@ -41,6 +41,7 @@ class Config:
     CHUNK_OVERLAP = 200
     TOP_K_CHUNKS = 3
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    EMBEDDING_MODEL_PATH = "./models/all-MiniLM-L6-v2"
     GEMINI_MODEL = "gemini-1.5-flash"
 
 
@@ -65,6 +66,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.on_event("startup")
+async def load_models():
+    logger.info("Loading embedding model...")
+    app.state.embeddings = SentenceTransformerEmbeddings(
+        model_name=Config.EMBEDDING_MODEL,
+        cache_folder=Config.EMBEDDING_MODEL_PATH
+    )
 
 
 # custom exceptions
@@ -331,8 +341,7 @@ def create_vector_store(chunks: List[str]) -> FAISS:
 
     logger.info(f"Creating vector store with {len(chunks)} chunks")
     try:
-        embeddings = SentenceTransformerEmbeddings(model_name=Config.EMBEDDING_MODEL)
-        vector_store = FAISS.from_texts(texts=chunks, embedding=embeddings)
+        vector_store = FAISS.from_texts(texts=chunks, embedding=app.state.embeddings)
         return vector_store
     except Exception as e:
         logger.error(f"Failed to create vector store: {str(e)}")
@@ -342,21 +351,38 @@ def create_vector_store(chunks: List[str]) -> FAISS:
 # LLM
 async def generate_answer_with_llm(question: str, context: str) -> str:
     prompt = f"""
-    You are a helpful assistant that answers questions based strictly on the provided context.
-    Follow these guidelines:
-    1. Be concise and factual
-    2. Only use information from the provided context
-    3. If the answer isn't in the context, say "The answer could not be found in the document"
-    4. Format lists and important points clearly
+    Role: You are an expert insurance policy analyst specialized in health insurance policies. Your task is to extract precise information from policy documents and answer questions with exact details including numbers, conditions, and limitations.
 
-    Context:
+    Instructions:
+    1. Answer ONLY using information from the provided policy context
+    2. Be extremely precise with numbers, periods, and conditions
+    3. Format answers as complete sentences mirroring the policy language
+    4. Include all relevant conditions and limitations
+    5. If the answer contains multiple points, present them as a single cohesive answer
+    6. For definitions, quote the exact policy wording when possible
+    7. For coverage questions, always specify:
+       - Whether it's covered (Yes/No)
+       - Any waiting periods
+       - Specific conditions
+       - Limitations or sub-limits
+
+    Policy Context:
     ---
     {context}
     ---
 
     Question: {question}
 
-    Answer:
+    Answer Structure Guidelines:
+    1. Begin with a direct answer to the question
+    2. Include all numerical values exactly as in the policy (e.g., "thirty (30) days" not "30 days")
+    3. List conditions as part of the sentence flow
+    4. For coverage questions, use this pattern:
+       "[Yes/No], [coverage details]. [Conditions]: [specific requirements]. [Limitations]: [any caps or exclusions]."
+
+    Current Question: {question}
+
+    Required Answer Format: A single, well-structured paragraph containing all relevant details from the policy document.
     """
 
     logger.info(f"Generating answer for question: {question[:50]}...")
