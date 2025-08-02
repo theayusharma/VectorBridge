@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import docx
-import google.generativeai as genai
+import google.genai as genai
 import httpx
 import pdfplumber
 import textract
@@ -27,9 +27,8 @@ from langchain_community.vectorstores import FAISS
 from pydantic import BaseModel, Field, HttpUrl
 
 from geminiloadbalance import get_next_api_key
-import google.generativeai as genai
 
-genai.configure(api_key=get_next_api_key())
+client = genai.Client(api_key=get_next_api_key())
 
 
 logging.basicConfig(
@@ -38,7 +37,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 #no 
-load_dotenv()
+# load_dotenv()
 
 
 class Config:
@@ -388,7 +387,7 @@ async def generate_answer_with_llm(question: str, context: str) -> str:
 
     logger.info(f"Generating answer for question: {question[:50]}...")
     try:
-        model = genai.GenerativeModel(Config.GEMINI_MODEL)
+        model = client.GenerativeModel(Config.GEMINI_MODEL)
         response = await model.generate_content_async(prompt)
         return response.text.strip()
     except Exception as e:
