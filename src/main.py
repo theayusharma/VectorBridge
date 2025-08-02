@@ -53,7 +53,9 @@ genai.configure(api_key=GEMINI_API_KEY)
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 app = FastAPI(title="HackRx RAG API", version="0.2.0")
 
-app.add_middleware(HTTPSRedirectMiddleware)
+if os.getenv("ENVIRONMENT") == "production":
+    from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+    app.add_middleware(HTTPSRedirectMiddleware)
 
 # CORS
 app.add_middleware(
@@ -465,6 +467,6 @@ if __name__ == "__main__":
         port=8080,
         proxy_headers=True,
         forwarded_allow_ips="*",
-        timeout_keep_alive=60,
-        http="h11",
+        log_config=None,
+        reload=True if os.getenv("ENVIRONMENT") == "development" else False
     )
