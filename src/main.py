@@ -5,6 +5,7 @@ import logging
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -28,9 +29,6 @@ from pydantic import BaseModel, Field, HttpUrl
 
 from geminiloadbalance import get_next_api_key
 
-
-
-
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
@@ -50,9 +48,40 @@ class Config:
     EMBEDDING_MODEL_PATH = "./models/all-MiniLM-L6-v2"
     GEMINI_MODEL = "gemini-1.5-flash"
 
+API_HIT_COUNT = 0
+API_LOG_FILE = "api_logs.txt"
+
+def load_api_hit_count():
+    global API_HIT_COUNT
+    try:
+        with open(API_LOG_FILE, "r") as f:
+            for line in f:
+                if "API hit count" in line:
+                    API_HIT_COUNT = int(line.split(":")[-1].strip())
+                    logger.info(f"Loaded API hit count: {API_HIT_COUNT}")
+    except FileNotFoundError:
+        logger.info("api_logs.txt not found, starting hit count from 0")
+        API_HIT_COUNT = 0
+
+def save_api_hit_count():
+    with open(API_LOG_FILE, "a") as f:
+        f.write(f"API hit count: {API_HIT_COUNT}\n")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    load_api_hit_count()
+    logger.info("Loading embedding model...")
+    app.state.embeddings = SentenceTransformerEmbeddings(
+        model_name=Config.EMBEDDING_MODEL,
+        cache_folder=Config.EMBEDDING_MODEL_PATH
+    )
+    yield
+    # Clean up resources if needed on shutdown
+    logger.info("Shutting down...")
+
 # FastAPI app
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
-app = FastAPI(title="HackRx RAG API", version="0.2.0")
+app = FastAPI(title="HackRx RAG API", version="0.2.0", lifespan=lifespan)
 
 if os.getenv("ENVIRONMENT") == "production":
     from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
@@ -67,14 +96,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-@app.on_event("startup")
-async def load_models():
-    logger.info("Loading embedding model...")
-    app.state.embeddings = SentenceTransformerEmbeddings(
-        model_name=Config.EMBEDDING_MODEL,
-        cache_folder=Config.EMBEDDING_MODEL_PATH
-    )
 
 
 # custom exceptions
@@ -436,6 +457,10 @@ async def root():
 async def hackrx_run(
     req: HackRxRequest, api_key: str = Security(get_api_key)
 ) -> HackRxResponse:
+    global API_HIT_COUNT
+    API_HIT_COUNT += 1
+    save_api_hit_count()
+
     start_time = asyncio.get_event_loop().time()
 
     try:
@@ -485,7 +510,6 @@ async def hackrx_run(
         )
 
 
-# server
 if __name__ == "__main__":
     import uvicorn
 
