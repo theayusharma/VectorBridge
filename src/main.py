@@ -459,4 +459,12 @@ async def hackrx_run(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8080, timeout_keep_alive=60, log_config=None)
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8080,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+        timeout_keep_alive=60,
+        http="h11",
+    )
