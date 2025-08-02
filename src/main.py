@@ -26,11 +26,18 @@ from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import FAISS
 from pydantic import BaseModel, Field, HttpUrl
 
+from geminiloadbalance import get_next_api_key
+import google.generativeai as genai
+
+genai.configure(api_key=get_next_api_key())
+
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
+#no 
 load_dotenv()
 
 
@@ -43,12 +50,6 @@ class Config:
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
     EMBEDDING_MODEL_PATH = "./models/all-MiniLM-L6-v2"
     GEMINI_MODEL = "gemini-1.5-flash"
-
-
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    raise RuntimeError("Missing environment variable: GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
 
 # FastAPI app
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)

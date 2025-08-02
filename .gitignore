@@ -1,2 +1,4 @@
 .env
 models/
+.venv/
+__src/pycache.pyc__
