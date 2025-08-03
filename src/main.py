@@ -1,10 +1,10 @@
 import asyncio
 import email
+import hashlib
 import io
 import logging
 import os
 import re
-import hashlib
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
@@ -13,7 +13,6 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import docx
-import google.generativeai as genai
 import httpx
 import pdfplumber
 import textract
@@ -28,15 +27,14 @@ from langchain_community.embeddings import SentenceTransformerEmbeddings
 from langchain_community.vectorstores import FAISS
 from pydantic import BaseModel, Field, HttpUrl
 
-from geminiloadbalance import get_next_api_key
+from geminiloadbalance import LLMGenerationError, generate_text_with_retry
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-#no 
-# load_dotenv()
+load_dotenv()
 
 
 class Config:
@@ -46,56 +44,21 @@ class Config:
     CHUNK_OVERLAP = 200
     TOP_K_CHUNKS = 3
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-    EMBEDDING_MODEL_PATH = "./models/all-MiniLM-L6-v2"
     GEMINI_MODEL = "gemini-1.5-flash"
+    MAX_LLM_RETRIES = 3
+
+    # cache
+    EMBEDDING_MODEL_PATH = "./models/{EMBEDDING_MODEL}"
     CACHE_DIR = Path("cache")
     DOCUMENT_CACHE_DIR = CACHE_DIR / "document"
     VECTORDB_CACHE_DIR = CACHE_DIR / "vectordb"
 
-API_HIT_COUNT = 0
-API_COUNT_FILE = "api_hit_count.txt"
-API_LOG_FILE = "api_logs.txt"
-
-def load_api_hit_count():
-    global API_HIT_COUNT
-    try:
-        with open(API_COUNT_FILE, "r") as f:
-            API_HIT_COUNT = int(f.read().strip())
-            logger.info(f"Loaded API hit count: {API_HIT_COUNT}")
-    except (FileNotFoundError, ValueError):
-        logger.info("api_hit_count.txt not found or invalid, starting hit count from 0")
-        API_HIT_COUNT = 0
-
-def save_api_hit_count():
-    with open(API_COUNT_FILE, "w") as f:
-        f.write(str(API_HIT_COUNT))
-
-
-def manage_log_file():
-    if not os.path.exists(API_LOG_FILE):
-        return
-
-    # Check if file size exceeds 10MB
-    if os.path.getsize(API_LOG_FILE) > 10 * 1024 * 1024:
-        logger.info("api_logs.txt exceeds 10MB, trimming...")
-        with open(API_LOG_FILE, "r") as f:
-            lines = f.readlines()
-        
-        # Keep the last 50 lines
-        if len(lines) > 50:
-            with open(API_LOG_FILE, "w") as f:
-                f.writelines(lines[-50:])
-            logger.info("api_logs.txt trimmed, keeping the last 50 lines.")
-
-
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    load_api_hit_count()
     logger.info("Loading embedding model...")
     app.state.embeddings = SentenceTransformerEmbeddings(
-        model_name=Config.EMBEDDING_MODEL,
-        cache_folder=Config.EMBEDDING_MODEL_PATH
+        model_name=Config.EMBEDDING_MODEL, cache_folder=Config.EMBEDDING_MODEL_PATH
     )
     # Create cache directories if they don't exist
     Config.DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -104,12 +67,14 @@ async def lifespan(app: FastAPI):
     # Clean up resources if needed on shutdown
     logger.info("Shutting down...")
 
+
 # FastAPI app
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
 app = FastAPI(title="HackRx RAG API", version="0.2.0", lifespan=lifespan)
 
 if os.getenv("ENVIRONMENT") == "production":
     from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
+
     app.add_middleware(HTTPSRedirectMiddleware)
 
 # CORS
@@ -122,12 +87,8 @@ app.add_middleware(
 )
 
 
-
 # custom exceptions
 class DocumentProcessingError(Exception):
-    pass
-
-class LLMGenerationError(Exception):
     pass
 
 
@@ -140,6 +101,7 @@ async def document_processing_exception_handler(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={"detail": str(exc)},
     )
+
 
 @app.exception_handler(LLMGenerationError)
 async def llm_generation_exception_handler(request: Request, exc: LLMGenerationError):
@@ -196,6 +158,7 @@ class HackRxRequest(BaseModel):
         le=10,
         description="Number of relevant chunks to retrieve",
     )
+
 
 class HackRxResponse(BaseModel):
     answers: List[str]
@@ -313,37 +276,39 @@ PARSER_MAPPING: Dict[str, callable] = {
 
 
 # doc downloader
-async def get_document_content_from_url(url: Union[str, HttpUrl]) -> Tuple[io.BytesIO, str]:
+async def get_document_content_from_url(
+    url: Union[str, HttpUrl],
+) -> Tuple[io.BytesIO, str]:
     logger.info(f"Downloading document from {url}")
-    
+
     url_str = str(url) if isinstance(url, HttpUrl) else url
-    
+
     try:
         async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
             head_response = await client.head(url_str, follow_redirects=True)
             head_response.raise_for_status()
-            
+
             content_length = head_response.headers.get("content-length")
             if content_length and int(content_length) > Config.MAX_FILE_SIZE:
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB"
+                    detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB",
                 )
-            
+
             response = await client.get(url_str, follow_redirects=True)
             response.raise_for_status()
-            
+
             file_ext = Path(urlparse(url_str).path).suffix.lower()
             if not file_ext or file_ext not in PARSER_MAPPING:
                 file_ext = ".txt"
-            
+
             content = io.BytesIO(await response.aread())
             if content.getbuffer().nbytes > Config.MAX_FILE_SIZE:
                 raise HTTPException(
                     status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB"
+                    detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB",
                 )
-            
+
             return content, file_ext
     except httpx.RequestError as e:
         logger.error(f"Failed to download document: {str(e)}")
@@ -384,8 +349,11 @@ def clean_and_chunk_text(
 def get_document_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
+
 # vector store
-def create_vector_store(chunks: List[str], embeddings: SentenceTransformerEmbeddings) -> FAISS:
+def create_vector_store(
+    chunks: List[str], embeddings: SentenceTransformerEmbeddings
+) -> FAISS:
     if not chunks:
         raise ValueError("Cannot create vector store from empty text chunks")
 
@@ -400,8 +368,6 @@ def create_vector_store(chunks: List[str], embeddings: SentenceTransformerEmbedd
 
 # LLM
 async def generate_answer_with_llm(question: str, context: str) -> str:
-    genai.configure(api_key=get_next_api_key())
-
     prompt = f"""
     Role: You are an expert insurance policy analyst specialized in health insurance policies. Your task is to extract precise information from policy documents and answer questions with exact details including numbers, conditions, and limitations.
 
@@ -438,13 +404,11 @@ async def generate_answer_with_llm(question: str, context: str) -> str:
     """
 
     logger.info(f"Generating answer for question: {question[:50]}...")
-    try:
-        model = genai.GenerativeModel(Config.GEMINI_MODEL)
-        response = await model.generate_content_async(prompt)
-        return response.text.strip()
-    except Exception as e:
-        logger.error(f"LLM generation failed: {str(e)}")
-        raise LLMGenerationError("Failed to generate answer from document")
+    return await generate_text_with_retry(
+        prompt=prompt,
+        model_name=Config.GEMINI_MODEL,
+        max_retries=Config.MAX_LLM_RETRIES,
+    )
 
 
 # process questions in parallel
@@ -486,25 +450,21 @@ async def root():
 async def hackrx_run(
     req: HackRxRequest, api_key: str = Security(get_api_key)
 ) -> HackRxResponse:
-    global API_HIT_COUNT
-    API_HIT_COUNT += 1
-    save_api_hit_count()
-
     start_time = asyncio.get_event_loop().time()
 
     try:
         content_bytes, file_ext = await get_document_content_from_url(req.documents)
         doc_hash = get_document_hash(content_bytes.getvalue())
-        
+
         vector_store_path = Config.VECTORDB_CACHE_DIR / f"{doc_hash}.faiss"
-        
+
         if vector_store_path.exists():
             logger.info(f"Loading vector store from cache: {vector_store_path}")
             vector_store = FAISS.load_local(
                 folder_path=str(Config.VECTORDB_CACHE_DIR),
                 index_name=doc_hash,
                 embeddings=app.state.embeddings,
-                allow_dangerous_deserialization=True
+                allow_dangerous_deserialization=True,
             )
             metadata = {"source": "cache"}
         else:
@@ -527,13 +487,16 @@ async def hackrx_run(
             vector_store = await asyncio.get_event_loop().run_in_executor(
                 None, create_vector_store, text_chunks, app.state.embeddings
             )
-            
+
             # Save to cache
-            vector_store.save_local(folder_path=str(Config.VECTORDB_CACHE_DIR), index_name=doc_hash)
+            vector_store.save_local(
+                folder_path=str(Config.VECTORDB_CACHE_DIR), index_name=doc_hash
+            )
             with open(Config.DOCUMENT_CACHE_DIR / doc_hash, "wb") as f:
                 f.write(content_bytes.getvalue())
-            logger.info(f"Saved new document and vector store to cache with hash: {doc_hash}")
-
+            logger.info(
+                f"Saved new document and vector store to cache with hash: {doc_hash}"
+            )
 
         answers = await process_questions_parallel(
             req.questions, vector_store, req.top_k
@@ -547,12 +510,8 @@ async def hackrx_run(
             document_metadata=metadata,
         )
 
-    except HTTPException:
-        raise
-    except DocumentProcessingError as e:
-        raise
-    except LLMGenerationError as e:
-        raise
+    except (HTTPException, DocumentProcessingError, LLMGenerationError) as e:
+        raise e
     except Exception as e:
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(
@@ -571,5 +530,5 @@ if __name__ == "__main__":
         proxy_headers=True,
         forwarded_allow_ips="*",
         log_config=None,
-        reload=True if os.getenv("ENVIRONMENT") == "development" else False
+        reload=True if os.getenv("ENVIRONMENT") == "development" else False,
     )

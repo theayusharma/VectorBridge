@@ -1,6 +1,8 @@
 .env
 models/
 .venv/
+cache/
+__pycache__/
 __src/pycache.pyc__
 api_logs.txt
 api_hit_count.txt
