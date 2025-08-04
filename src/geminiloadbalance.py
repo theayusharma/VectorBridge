@@ -43,7 +43,7 @@ api_key_manager = GeminiAPIManager()
 async def generate_text_with_retry(
     prompt: str,
     model_name: str,
-    max_retries: int,
+    max_retries: int = len(api_key_manager.keys),
     retry_delay: int = 1,
 ) -> str:
     last_exception = None
