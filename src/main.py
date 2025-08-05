@@ -1,5 +1,4 @@
 import asyncio
-import email
 import hashlib
 import io
 import json
@@ -13,10 +12,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
-import docx
 import httpx
-import pdfplumber
-import textract
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Security, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -24,11 +20,17 @@ from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import SentenceTransformerEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, HttpUrl
 
 from geminiloadbalance import LLMGenerationError, generate_text_with_retry
+from parsers import (
+    PARSER_MAPPING,
+    DocumentProcessingError,
+    DocumentStructure,
+    ChunkMetadata,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -37,9 +39,11 @@ logger = logging.getLogger(__name__)
 
 load_dotenv()
 
+HACKRX_AUTH_TOKEN = os.getenv("HACKRX_AUTH_TOKEN")
+
 
 class Config:
-    MAX_FILE_SIZE = 30 * 1024 * 1024  # 30MB
+    MAX_FILE_SIZE = 200 * 1024 * 1024  # 200MB
     REQUEST_TIMEOUT = 30.0
     CHUNK_SIZE = 800
     CHUNK_OVERLAP = 150
@@ -64,21 +68,20 @@ class Config:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Loading embedding model...")
-    app.state.embeddings = SentenceTransformerEmbeddings(
+    app.state.embeddings = HuggingFaceEmbeddings(
         model_name=Config.EMBEDDING_MODEL, cache_folder=Config.EMBEDDING_MODEL_PATH
     )
-    # Create cache directories if they don't exist
+
     Config.DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     Config.VECTORDB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     Config.METADATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
     yield
     logger.info("Shutting down...")
 
 
 # FastAPI app
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
-app = FastAPI(title="HackRx RAG API", version="0.3.0", lifespan=lifespan)
+app = FastAPI(title="HackRx RAG API", version="0.1.1", lifespan=lifespan)
 
 if os.getenv("ENVIRONMENT") == "production":
     from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
@@ -95,43 +98,10 @@ app.add_middleware(
 )
 
 
-# data structures
-class ChunkMetadata:
-    def __init__(
-        self,
-        chunk_id: str,
-        page_num: Optional[int] = None,
-        section: Optional[str] = None,
-        keywords: Optional[List[str]] = None,
-        chunk_type: str = "text",
-        importance_score: float = 1.0,
-    ):
-        self.chunk_id = chunk_id
-        self.page_num = page_num
-        self.section = section
-        self.keywords = keywords or []
-        self.chunk_type = chunk_type
-        self.importance_score = importance_score
-
-
-class DocumentStructure:
-    def __init__(self):
-        self.sections: Dict[str, List[str]] = {}
-        self.headers: List[Tuple[str, int]] = []  # (header_text, level)
-        self.tables: List[Dict[str, Any]] = []
-        self.key_value_pairs: Dict[str, str] = {}
-        self.definitions: Dict[str, str] = {}
-
-
-# custom exceptions
-class DocumentProcessingError(Exception):
-    pass
-
-
 # exception handlers
 @app.exception_handler(DocumentProcessingError)
 async def document_processing_exception_handler(
-    request: Request, exc: DocumentProcessingError
+    _request: Request, exc: DocumentProcessingError
 ):
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -140,7 +110,7 @@ async def document_processing_exception_handler(
 
 
 @app.exception_handler(LLMGenerationError)
-async def llm_generation_exception_handler(request: Request, exc: LLMGenerationError):
+async def llm_generation_exception_handler(_request: Request, exc: LLMGenerationError):
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": str(exc)},
@@ -149,25 +119,13 @@ async def llm_generation_exception_handler(request: Request, exc: LLMGenerationE
 
 # auth check
 async def get_api_key(api_key_header: str = Security(api_key_header)):
-    if api_key_header is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization header is missing.",
-        )
-
     parts = api_key_header.split()
     if len(parts) != 2 or parts[0].lower() != "bearer":
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Authorization header format. Must be 'Bearer <key>'.",
-        )
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
 
     token = parts[1]
-    if token != os.getenv("HACKRX_AUTH_TOKEN"):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Bearer token",
-        )
+    if token != HACKRX_AUTH_TOKEN:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED)
     return token
 
 
@@ -175,25 +133,6 @@ async def get_api_key(api_key_header: str = Security(api_key_header)):
 class HackRxRequest(BaseModel):
     documents: HttpUrl
     questions: List[str]
-
-    chunk_size: Optional[int] = Field(
-        default=Config.CHUNK_SIZE,
-        ge=100,
-        le=2000,
-        description="Size of text chunks for processing",
-    )
-    chunk_overlap: Optional[int] = Field(
-        default=Config.CHUNK_OVERLAP,
-        ge=0,
-        le=500,
-        description="Overlap between text chunks",
-    )
-    top_k: Optional[int] = Field(
-        default=Config.TOP_K_CHUNKS,
-        ge=1,
-        le=15,
-        description="Number of relevant chunks to retrieve",
-    )
 
 
 class HackRxResponse(BaseModel):
@@ -229,13 +168,8 @@ def extract_keywords(text: str) -> List[str]:
         "endorsement",
     ]
 
-    # capitalized terms
     capitalized_terms = re.findall(r"\b[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\b", text)
-
-    # numbers with currency or percentages
     financial_terms = re.findall(r"[\$₹]\s?[\d,]+(?:\.\d{2})?|\d+(?:\.\d+)?%", text)
-
-    # dates
     date_patterns = re.findall(
         r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\w+\s+\d{1,2},?\s+\d{4}\b", text
     )
@@ -248,216 +182,6 @@ def extract_keywords(text: str) -> List[str]:
     keywords.extend(date_patterns)
 
     return list(set(keywords))
-
-
-# PDF parser
-def parse_pdf(content: io.BytesIO) -> Tuple[str, Dict[str, Any], DocumentStructure]:
-    full_text = []
-    metadata = {"pages": 0, "tables": 0, "sections": 0}
-    doc_structure = DocumentStructure()
-
-    try:
-        with pdfplumber.open(content) as pdf:
-            metadata["pages"] = len(pdf.pages)
-            current_section = "Introduction"
-
-            for i, page in enumerate(pdf.pages):
-                page_text = page.extract_text(x_tolerance=2) or ""
-
-                # headers (lines that are likely section headers)
-                lines = page_text.split("\n")
-                for line in lines:
-                    line = line.strip()
-                    if line and (
-                        line.isupper()
-                        or re.match(r"^[A-Z][A-Za-z\s]+:$", line)
-                        or re.match(r"^\d+\.\s+[A-Z]", line)
-                    ):
-                        doc_structure.headers.append((line, 1))
-                        current_section = line
-                        metadata["sections"] += 1
-
-                # add to chunks
-                if current_section not in doc_structure.sections:
-                    doc_structure.sections[current_section] = []
-                doc_structure.sections[current_section].append(page_text)
-
-                full_text.append(
-                    f"--- Page {i+1} | Section: {current_section} ---\n{page_text}"
-                )
-
-                # tables
-                tables = page.extract_tables()
-                if tables:
-                    metadata["tables"] += len(tables)
-                    for j, table in enumerate(tables):
-                        table_metadata = {
-                            "page": i + 1,
-                            "table_id": f"table_{i+1}_{j+1}",
-                            "rows": len(table),
-                            "cols": len(table[0]) if table else 0,
-                        }
-                        doc_structure.tables.append(table_metadata)
-
-                        # conversion to markdown
-                        if table and len(table) > 1:
-                            headers = table[0]
-                            markdown_table = (
-                                "| "
-                                + " | ".join(
-                                    str(cell) if cell else "" for cell in headers
-                                )
-                                + " |\n"
-                            )
-                            markdown_table += "|" + "---|" * len(headers) + "\n"
-
-                            for row in table[1:]:
-                                markdown_table += (
-                                    "| "
-                                    + " | ".join(
-                                        str(cell) if cell else "" for cell in row
-                                    )
-                                    + " |\n"
-                                )
-
-                            full_text.append(
-                                f"\n--- Table {j+1} on Page {i+1} ---\n{markdown_table}\n"
-                            )
-
-                # key-value pairs
-                kv_matches = re.findall(r"([A-Z][A-Za-z\s]+):\s*([^\n]+)", page_text)
-                for key, value in kv_matches:
-                    doc_structure.key_value_pairs[key.strip()] = value.strip()
-    except Exception as e:
-        raise DocumentProcessingError(f"Failed to parse PDF: {str(e)}")
-
-    return "\n".join(full_text), metadata, doc_structure
-
-
-# DOCX parser
-def parse_docx(content: io.BytesIO) -> Tuple[str, Dict[str, Any], DocumentStructure]:
-    try:
-        doc = docx.Document(content)
-        doc_structure = DocumentStructure()
-        full_text = []
-        current_section = "Introduction"
-
-        metadata = {
-            "paragraphs": len(doc.paragraphs),
-            "tables": len(doc.tables),
-            "sections": len(doc.sections),
-        }
-
-        for para in doc.paragraphs:
-            if para.text.strip():  # todo check errors from lsp
-                # header
-                if para.style.name.startswith("Heading") or (
-                    para.text.isupper() and len(para.text) < 100
-                ):
-                    level = 1
-                    if "Heading" in para.style.name:
-                        level = (
-                            int(para.style.name.split()[-1])
-                            if para.style.name.split()[-1].isdigit()
-                            else 1
-                        )
-                    doc_structure.headers.append((para.text, level))
-                    current_section = para.text
-
-                # add to section
-                if current_section not in doc_structure.sections:
-                    doc_structure.sections[current_section] = []
-                doc_structure.sections[current_section].append(para.text)
-
-                full_text.append(f"[Section: {current_section}] {para.text}")
-
-        # tables
-        for i, table in enumerate(doc.tables):
-            table_text = []
-            for row in table.rows:
-                row_text = [cell.text.strip() for cell in row.cells]
-                table_text.append(" | ".join(row_text))
-
-            table_metadata = {
-                "table_id": f"docx_table_{i+1}",
-                "rows": len(table.rows),
-                "cols": len(table.rows[0].cells) if table.rows else 0,
-            }
-            doc_structure.tables.append(table_metadata)
-            full_text.append(f"\n--- Table {i+1} ---\n" + "\n".join(table_text) + "\n")
-
-        return "\n".join(full_text), metadata, doc_structure
-    except Exception as e:
-        raise DocumentProcessingError(f"Failed to parse DOCX: {str(e)}")
-
-
-def parse_doc(
-    content: io.BytesIO,
-) -> Tuple[str, Dict[str, Any], Optional[DocumentStructure]]:
-    temp_file_path = "temp_file.doc"
-    try:
-        with open(temp_file_path, "wb") as f:
-            f.write(content.read())
-
-        text = textract.process(temp_file_path).decode("utf-8")
-        return text, {"format": "DOC"}, None
-    except Exception as e:
-        raise DocumentProcessingError(f"Failed to parse DOC: {str(e)}")
-    finally:
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
-
-
-def parse_eml(
-    content: io.BytesIO,
-) -> Tuple[str, Dict[str, Any], Optional[DocumentStructure]]:
-    try:
-        msg = email.message_from_bytes(content.read())
-        metadata = {
-            "subject": msg["subject"],
-            "from": msg["from"],
-            "to": msg["to"],
-            "date": msg["date"],
-            "content_type": msg.get_content_type(),
-        }
-
-        body = ""
-        if msg.is_multipart():
-            for part in msg.walk():
-                ctype = part.get_content_type()
-                if ctype == "text/plain":
-                    body = part.get_payload(decode=True).decode(errors="ignore")
-                    break
-        else:
-            body = msg.get_payload(decode=True).decode(errors="ignore")
-
-        return (
-            f"Subject: {msg['subject']}\nFrom: {msg['from']}\nTo: {msg['to']}\n\n{body}",
-            metadata,
-            None,
-        )
-    except Exception as e:
-        raise DocumentProcessingError(f"Failed to parse EML: {str(e)}")
-
-
-def parse_txt(
-    content: io.BytesIO,
-) -> Tuple[str, Dict[str, Any], Optional[DocumentStructure]]:
-    try:
-        text = content.read().decode("utf-8", errors="ignore")
-        return text, {"size": len(text)}, None
-    except Exception as e:
-        raise DocumentProcessingError(f"Failed to parse TXT: {str(e)}")
-
-
-# parser mapping
-PARSER_MAPPING: Dict[str, callable] = {
-    ".pdf": parse_pdf,
-    ".docx": parse_docx,
-    ".doc": parse_doc,
-    ".eml": parse_eml,
-    ".txt": parse_txt,
-}
 
 
 # doc downloader
@@ -657,7 +381,7 @@ def load_metadata(
 # vector store creation
 def create_vector_store(
     chunks: List[str],
-    embeddings: SentenceTransformerEmbeddings,
+    embeddings: HuggingFaceEmbeddings,
     chunk_metadata: Optional[List[ChunkMetadata]] = None,
 ) -> FAISS:
     if not chunks:
@@ -671,16 +395,15 @@ def create_vector_store(
             metadata = {"chunk_index": i}
             if chunk_metadata and i < len(chunk_metadata):
                 cm = chunk_metadata[i]
-                metadata.update(
-                    {
-                        "chunk_id": cm.chunk_id,
-                        "page_num": cm.page_num,
-                        "section": cm.section,
-                        "keywords": cm.keywords,
-                        "chunk_type": cm.chunk_type,
-                        "importance_score": cm.importance_score,
-                    }
-                )
+                cm_data = {
+                    "chunk_id": cm.chunk_id,
+                    "page_num": cm.page_num,
+                    "section": cm.section,
+                    "keywords": cm.keywords,
+                    "chunk_type": cm.chunk_type,
+                    "importance_score": cm.importance_score,
+                }
+                metadata.update(cm_data)
             metadatas.append(metadata)
 
         vector_store = FAISS.from_texts(
@@ -825,11 +548,11 @@ Question: {question}
 Required Output: Write a single, comprehensive paragraph that directly answers the customer's question with all relevant policy details, conditions, and limitations in a natural, flowing narrative format.
     """
 
-    logger.info(f"Generating answer for question: {question[:50]}...")
+    logger.info(f"Generating answer for question: {question}...")
     return await generate_text_with_retry(
         prompt=prompt,
         model_name=Config.GEMINI_MODEL,
-        #max_retries=Config.MAX_LLM_RETRIES,
+        # max_retries=Config.MAX_LLM_RETRIES,
     )
 
 
@@ -867,12 +590,12 @@ async def process_questions(
 # API endpoints
 @app.get("/")
 async def root():
-    return {"message": "Letsgoo, its up running........"}
+    return {"message": "Letsgoo, its up running........", "version": "0.1.1"}
 
 
 @app.post("/api/v1/hackrx/run", response_model=HackRxResponse)
 async def hackrx_run(
-    req: HackRxRequest, api_key: str = Security(get_api_key)
+    req: HackRxRequest, _api_key: str = Security(get_api_key)
 ) -> HackRxResponse:
     start_time = asyncio.get_event_loop().time()
 
@@ -910,11 +633,11 @@ async def hackrx_run(
                 metadata,
                 doc_structure,
             ) = await asyncio.get_event_loop().run_in_executor(
-                None, parser, io.BytesIO(content_bytes.getvalue())
+                None, parser.parse, io.BytesIO(content_bytes.getvalue())
             )
 
             text_chunks, chunk_metadata = clean_and_chunk_text(
-                raw_text, req.chunk_size, req.chunk_overlap
+                raw_text, Config.CHUNK_SIZE, Config.CHUNK_OVERLAP
             )
 
             vector_store = await asyncio.get_event_loop().run_in_executor(
@@ -942,7 +665,7 @@ async def hackrx_run(
             answers, context_metadatas = await process_questions(
                 req.questions,
                 vector_store,
-                req.top_k,
+                Config.TOP_K_CHUNKS,
                 chunk_metadata,
             )
 
@@ -967,7 +690,9 @@ async def hackrx_run(
                 },
             }
         else:
-            answers = await process_questions(req.questions, vector_store, req.top_k, None)
+            answers = await process_questions(
+                req.questions, vector_store, Config.TOP_K_CHUNKS, None
+            )
             aggregated_context_metadata = {
                 "total_questions": len(req.questions),
                 "processing_mode": "standard",
@@ -978,22 +703,21 @@ async def hackrx_run(
         # metadata for response
         response_metadata = metadata.copy()
         if doc_structure:
-            response_metadata.update(
-                {
-                    "document_structure": {
-                        "sections_found": len(doc_structure.sections),
-                        "headers_found": len(doc_structure.headers),
-                        "tables_found": len(doc_structure.tables),
-                        "key_value_pairs": len(doc_structure.key_value_pairs),
-                    }
+            doc_struct_data = {
+                "document_structure": {
+                    "sections_found": len(doc_structure.sections),
+                    "headers_found": len(doc_structure.headers),
+                    "tables_found": len(doc_structure.tables),
+                    "key_value_pairs": len(doc_structure.key_value_pairs),
                 }
-            )
+            }
+            response_metadata.update(doc_struct_data)  # type: ignore
 
         if chunk_metadata:
             chunk_types = {}
             for cm in chunk_metadata:
                 chunk_types[cm.chunk_type] = chunk_types.get(cm.chunk_type, 0) + 1
-            response_metadata["chunk_analysis"] = {
+            response_metadata["chunk_analysis"] = {  # type: ignore
                 "total_chunks": len(chunk_metadata),
                 "chunk_types": chunk_types,
                 "avg_importance_score": sum(
@@ -1003,7 +727,7 @@ async def hackrx_run(
             }
 
         return HackRxResponse(
-            answers=answers,
+            answers=answers,  # type: ignore
             processing_time=round(processing_time, 2),
             document_metadata=response_metadata,
             context_metadata=aggregated_context_metadata,
@@ -1029,5 +753,4 @@ if __name__ == "__main__":
         proxy_headers=True,
         forwarded_allow_ips="*",
         log_config=None,
-        reload=True if os.getenv("ENVIRONMENT") == "development" else False,
     )
