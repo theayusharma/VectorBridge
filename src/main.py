@@ -79,10 +79,13 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down...")
 
+
 try:
     nlp = en_core_web_md.load()
 except Exception as e:
-    logger.warning(f"Failed to load spaCy model: {e}. Falling back to basic keyword extraction.")
+    logger.warning(
+        f"Failed to load spaCy model: {e}. Falling back to basic keyword extraction."
+    )
     nlp = None
 
 # FastAPI app
@@ -154,7 +157,8 @@ def extract_keywords(text: str, use_spacy: bool = True) -> List[str]:
         doc = nlp(text)
         # Extract nouns, proper nouns, and significant verbs as keywords
         keywords = [
-            token.text.lower() for token in doc
+            token.text.lower()
+            for token in doc
             if token.pos_ in ["NOUN", "PROPN", "VERB"]
             and not token.is_stop
             and not token.is_punct
@@ -165,8 +169,8 @@ def extract_keywords(text: str, use_spacy: bool = True) -> List[str]:
         return [k for k in keywords if not (k in seen or seen.add(k))]
     else:
         # Fallback: simple word-based extraction
-        words = re.findall(r'\b\w{3,}\b', text.lower())
-        common_stopwords = {'the', 'and', 'for', 'with', 'from', 'that', 'this'}
+        words = re.findall(r"\b\w{3,}\b", text.lower())
+        common_stopwords = {"the", "and", "for", "with", "from", "that", "this"}
         return [word for word in words if word not in common_stopwords][:10]
 
 
@@ -232,7 +236,7 @@ def clean_and_chunk_text(
     table_pattern = r"(--- Table \d+ on Page \d+ ---.*?)(?=\n\n---|$)"
     tables = re.findall(table_pattern, cleaned_text, re.DOTALL)
     table_placeholders = [f"__TABLE_{i}__" for i in range(len(tables))]
-    
+
     for i, table in enumerate(tables):
         cleaned_text = cleaned_text.replace(table, table_placeholders[i])
 
@@ -283,7 +287,8 @@ def clean_and_chunk_text(
         if "--- Table" in chunk:
             chunk_type = "table"
         elif any(
-            keyword in chunk.lower() for keyword in ["exclusion", "coverage", "benefit", "claim", "policy"]
+            keyword in chunk.lower()
+            for keyword in ["exclusion", "coverage", "benefit", "claim", "policy"]
         ):
             chunk_type = "policy_rule"
 
@@ -422,87 +427,98 @@ def get_context(
     top_k: int,
     chunk_metadata: Optional[List[ChunkMetadata]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
-    # vector search
-    primary_docs = vector_store.similarity_search(question, k=top_k)
-    context_metadata = {
-        "primary_chunks": len(primary_docs),
-        "strategies_used": ["vector_similarity"],
-        "total_chunks": len(primary_docs),
-    }
-    selected_chunks = [
-        (doc.page_content, doc.metadata.get("importance_score", 1.0))
-        for doc in primary_docs
-    ]
+    try:
+        # vector search
+        primary_docs = vector_store.similarity_search(question, k=top_k)
+        if not primary_docs:
+            logger.warning("No documents found in vector search.")
+            return "", {"primary_chunks": 0, "strategies_used": ["vector_similarity"], "total_chunks": 0}
 
-    # keyword-based boost
-    if chunk_metadata:
-        question_keywords = extract_keywords(question.lower())
+        context_metadata = {
+            "primary_chunks": len(primary_docs),
+            "strategies_used": ["vector_similarity"],
+            "keyword_matches": 0,
+            "expanded_chunks": 0,
+            "total_chunks": 0,
+        }
 
-        # finding chunks with matching keywords
-        keyword_matches = []
-        all_texts = [
-            doc.page_content
-            for doc in vector_store.similarity_search(
-                "", k=len(chunk_metadata) if chunk_metadata else 100
-            )
+        selected_chunks = [
+            (doc.page_content, doc.metadata.get("importance_score", 1.0), doc.metadata)
+            for doc in primary_docs
         ]
+        seen_chunks = set(chunk[0] for chunk in selected_chunks)  # for deduplication
 
-        for i, text in enumerate(all_texts):
-            if i < len(chunk_metadata):
-                cm = chunk_metadata[i]
-                # check keyword overlap
+        # keyword-based boost
+        if chunk_metadata:
+            question_keywords = extract_keywords(question.lower(), use_spacy=nlp is not None)
+            keyword_matches = []
+
+            for cm in chunk_metadata:
+                text = cm.text if hasattr(cm, 'text') else None
+                if not text:
+                    continue
                 text_keywords = [kw.lower() for kw in cm.keywords]
-                question_kw_lower = [kw.lower() for kw in question_keywords]
-
-                overlap = set(text_keywords).intersection(set(question_kw_lower))
-                if overlap and text not in [chunk[0] for chunk in selected_chunks]:
-                    boost_score = (
-                        len(overlap) * Config.KEYWORD_BOOST_FACTOR * cm.importance_score
-                    )
+                overlap = set(text_keywords).intersection(set(question_keywords))
+                if overlap and text not in seen_chunks:
+                    boost_score = len(overlap) * Config.KEYWORD_BOOST_FACTOR * cm.importance_score
                     keyword_matches.append((text, boost_score, cm))
 
-        keyword_matches.sort(key=lambda x: x[1], reverse=True)
-        for text, score, cm in keyword_matches[:2]:  # top 2 matches
-            selected_chunks.append((text, score))
+            keyword_matches.sort(key=lambda x: x[1], reverse=True)
+            for text, score, cm in keyword_matches[:2]:  # top 2 matches
+                selected_chunks.append((text, score, cm.__dict__))
+                seen_chunks.add(text)
+            context_metadata["keyword_matches"] = len(keyword_matches[:2])
+            if keyword_matches:
+                context_metadata["strategies_used"].append("keyword_matching")
 
-        context_metadata["strategies_used"].append("keyword_matching")
-        context_metadata["keyword_matches"] = len(keyword_matches[:2])
-
-        # Context expansion - add neighboring chunks
         expanded_chunks = []
         primary_indices = [doc.metadata.get("chunk_index", -1) for doc in primary_docs]
 
         for idx in primary_indices:
-            if idx > 0:  # previous chunk
+            if idx == -1:
+                continue
+            # previous chunk
+            if idx > 0:
                 try:
                     prev_doc = vector_store.similarity_search("", k=idx + 1)[idx - 1]
-                    if prev_doc.page_content not in [
-                        chunk[0] for chunk in selected_chunks
-                    ]:
-                        expanded_chunks.append((prev_doc.page_content, 0.8))
-                except:
+                    if prev_doc.page_content not in seen_chunks:
+                        expanded_chunks.append((prev_doc.page_content, 0.8, prev_doc.metadata))
+                        seen_chunks.add(prev_doc.page_content)
+                except IndexError:
                     pass
+            # next chunk
+            try:
+                next_doc = vector_store.similarity_search("", k=idx + 2)[idx + 1]
+                if next_doc.page_content not in seen_chunks:
+                    expanded_chunks.append((next_doc.page_content, 0.8, next_doc.metadata))
+                    seen_chunks.add(next_doc.page_content)
+            except IndexError:
+                pass
 
-            # todo next chunk
-
-        selected_chunks.extend(expanded_chunks[:2])  # upto 2 chunks
-        context_metadata["strategies_used"].append("context_expansion")
+        selected_chunks.extend(expanded_chunks[:2])
         context_metadata["expanded_chunks"] = len(expanded_chunks[:2])
+        if expanded_chunks:
+            context_metadata["strategies_used"].append("context_expansion")
 
-    # Sort by importance score and combine
-    selected_chunks.sort(key=lambda x: x[1], reverse=True)
-    context_metadata["total_chunks"] = len(selected_chunks)
+        # sort by score and finalize context
+        selected_chunks.sort(key=lambda x: x[1], reverse=True)
+        context_metadata["total_chunks"] = len(selected_chunks)
 
-    # Combine all selected chunks
-    context_parts = []
-    for i, (chunk_text, score) in enumerate(selected_chunks):
-        context_parts.append(
-            f"--- Context Chunk {i+1} (Score: {score:.2f}) ---\n{chunk_text}"
-        )
+        # combine chunks with metadata annotations
+        context_parts = []
+        for i, (chunk_text, score, metadata) in enumerate(selected_chunks):
+            chunk_type = metadata.get("chunk_type", "text")
+            page_num = metadata.get("page_num", "Unknown")
+            section = metadata.get("section", "General")
+            header = f"--- Context Chunk {i+1} (Score: {score:.2f}, Type: {chunk_type}, Page: {page_num}, Section: {section}) ---"
+            context_parts.append(f"{header}\n{chunk_text}")
 
-    final_context = "\n\n".join(context_parts)
+        final_context = "\n\n".join(context_parts)
+        return final_context, context_metadata
 
-    return final_context, context_metadata
+    except Exception as e:
+        logger.error(f"Error in get_context: {str(e)}")
+        raise DocumentProcessingError(f"Failed to retrieve context: {str(e)}")
 
 
 # LLM

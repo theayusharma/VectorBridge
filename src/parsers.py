@@ -64,31 +64,35 @@ class PDFParser(BaseParser):
         doc_structure = DocumentStructure()
 
         try:
+            content.seek(0)
+            tables = camelot.read_pdf(
+                content,
+                flavor="lattice",
+                pages="all",
+                suppress_stdout=True,
+                process_background=True,
+            )
+            metadata["tables"] = len(tables)
+
+            content.seek(0)
             with pdfplumber.open(content) as pdf:
                 metadata["pages"] = len(pdf.pages)
                 current_section = "Introduction"
 
-                # camelot for table extraction
-                content.seek(0)
-                tables = camelot.read_pdf(content, flavor='lattice', pages='all')
+                header_pattern = re.compile(r"^[A-Z][A-Za-z\s]+:$|^\d+\.\s+[A-Z]")
+                kv_pattern = re.compile(r"([A-Z][A-Za-z\s]+):\s*([^\n]+)")
 
                 for i, page in enumerate(pdf.pages):
-                    page_text = page.extract_text(x_tolerance=2) or ""
+                    page_text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
 
-                    # headers (lines that are likely section headers)
                     lines = page_text.split("\n")
                     for line in lines:
                         line = line.strip()
-                        if line and (
-                            line.isupper()
-                            or re.match(r"^[A-Z][A-Za-z\s]+:$", line)
-                            or re.match(r"^\d+\.\s+[A-Z]", line)
-                        ):
+                        if line and (line.isupper() or header_pattern.match(line)):
                             doc_structure.headers.append((line, 1))
                             current_section = line
                             metadata["sections"] += 1
 
-                    # add to chunks
                     if current_section not in doc_structure.sections:
                         doc_structure.sections[current_section] = []
                     doc_structure.sections[current_section].append(page_text)
@@ -97,11 +101,12 @@ class PDFParser(BaseParser):
                         f"--- Page {i+1} | Section: {current_section} ---\n{page_text}"
                     )
 
-                    # tables (using Camelot)
                     page_tables = [t for t in tables if t.page == i + 1]
                     if page_tables:
-                        metadata["tables"] += len(page_tables)
                         for j, table in enumerate(page_tables):
+                            if table.shape[0] <= 1:
+                                continue
+
                             table_metadata = {
                                 "page": i + 1,
                                 "table_id": f"table_{i+1}_{j+1}",
@@ -110,49 +115,46 @@ class PDFParser(BaseParser):
                             }
                             doc_structure.tables.append(table_metadata)
 
-                            # conversion to markdown
-                            df = table.df  # Camelot table as pandas DataFrame
-                            if not df.empty and len(df) > 1:
-                                headers = df.iloc[0].tolist()
-                                # replace newlines and multiple spaces
-                                headers = [
-                                    re.sub(r'\s+', ' ', str(cell).strip()) if cell else ""
-                                    for cell in headers
-                                ]
-                                markdown_table = (
-                                    "| "
-                                    + " | ".join(headers)
-                                    + " |\n"
-                                )
-                                markdown_table += "|" + "---|" * len(headers) + "\n"
+                            df = table.df
+                            headers = [
+                                re.sub(r"\s+", " ", str(cell).strip()) if cell else ""
+                                for cell in df.iloc[0].tolist()
+                            ]
 
-                                for _, row in df[1:].iterrows():
-                                    # replace newlines and multiple spaces
-                                    cleaned_row = [
-                                        re.sub(r'\s+', ' ', str(cell).strip()) if cell else ""
-                                        for cell in row
-                                    ]
-                                    markdown_table += (
-                                        "| "
-                                        + " | ".join(cleaned_row)
-                                        + " |\n"
+                            rows = [
+                                "| "
+                                + " | ".join(
+                                    (
+                                        re.sub(r"\s+", " ", str(cell).strip())
+                                        if cell
+                                        else ""
                                     )
-
-                                full_text.append(
-                                    f"\n--- Table {j+1} on Page {i+1} ---\n{markdown_table}\n"
+                                    for cell in row
                                 )
+                                + " |"
+                                for _, row in df[1:].iterrows()
+                            ]
 
-                    # key-value pairs
-                    kv_matches = re.findall(r"([A-Z][A-Za-z\s]+):\s*([^\n]+)", page_text)
-                    for key, value in kv_matches:
+                            markdown_table = (
+                                "| "
+                                + " | ".join(headers)
+                                + " |\n"
+                                + "|"
+                                + "---|" * len(headers)
+                                + "\n"
+                                + "\n".join(rows)
+                                + "\n"
+                            )
+
+                            full_text.append(
+                                f"\n--- Table {j+1} on Page {i+1} ---\n{markdown_table}\n"
+                            )
+
+                    for key, value in kv_pattern.findall(page_text):
                         doc_structure.key_value_pairs[key.strip()] = value.strip()
 
         except Exception as e:
             raise DocumentProcessingError(f"Failed to parse PDF: {str(e)}")
-
-        # Write output to markdown
-        # with open("out.md", "w") as f:
-        #     f.write("\n".join(full_text))
 
         return "\n".join(full_text), metadata, doc_structure
 
