@@ -23,6 +23,7 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from pydantic import BaseModel, HttpUrl
+import en_core_web_md
 
 from geminiloadbalance import LLMGenerationError, generate_text_with_retry
 from parsers import (
@@ -49,7 +50,7 @@ class Config:
     CHUNK_OVERLAP = 150
     TOP_K_CHUNKS = 5
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
-    GEMINI_MODEL = "gemini-1.5-flash"
+    GEMINI_MODEL = "gemini-2.5-flash"
     MAX_LLM_RETRIES = 3
 
     # context parameters
@@ -78,6 +79,11 @@ async def lifespan(app: FastAPI):
     yield
     logger.info("Shutting down...")
 
+try:
+    nlp = en_core_web_md.load()
+except Exception as e:
+    logger.warning(f"Failed to load spaCy model: {e}. Falling back to basic keyword extraction.")
+    nlp = None
 
 # FastAPI app
 api_key_header = APIKeyHeader(name="Authorization", auto_error=False)
@@ -143,45 +149,25 @@ class HackRxResponse(BaseModel):
 
 
 # keyword extraction
-def extract_keywords(text: str) -> List[str]:
-    # insurance-specific keywords
-    insurance_keywords = [
-        "premium",
-        "deductible",
-        "coverage",
-        "exclusion",
-        "claim",
-        "policy",
-        "benefit",
-        "liability",
-        "copay",
-        "coinsurance",
-        "network",
-        "provider",
-        "pre-existing",
-        "waiting period",
-        "grace period",
-        "effective date",
-        "termination",
-        "renewal",
-        "rider",
-        "endorsement",
-    ]
-
-    capitalized_terms = re.findall(r"\b[A-Z][A-Za-z]+(?:\s+[A-Z][A-Za-z]+)*\b", text)
-    financial_terms = re.findall(r"[\$₹]\s?[\d,]+(?:\.\d{2})?|\d+(?:\.\d+)?%", text)
-    date_patterns = re.findall(
-        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b|\b\w+\s+\d{1,2},?\s+\d{4}\b", text
-    )
-
-    # combine all extracted terms
-    keywords = []
-    keywords.extend([kw for kw in insurance_keywords if kw.lower() in text.lower()])
-    keywords.extend(capitalized_terms[:5])  # limit to 5
-    keywords.extend(financial_terms)
-    keywords.extend(date_patterns)
-
-    return list(set(keywords))
+def extract_keywords(text: str, use_spacy: bool = True) -> List[str]:
+    if use_spacy and nlp:
+        doc = nlp(text)
+        # Extract nouns, proper nouns, and significant verbs as keywords
+        keywords = [
+            token.text.lower() for token in doc
+            if token.pos_ in ["NOUN", "PROPN", "VERB"]
+            and not token.is_stop
+            and not token.is_punct
+            and len(token.text) > 2
+        ]
+        # Remove duplicates while preserving order
+        seen = set()
+        return [k for k in keywords if not (k in seen or seen.add(k))]
+    else:
+        # Fallback: simple word-based extraction
+        words = re.findall(r'\b\w{3,}\b', text.lower())
+        common_stopwords = {'the', 'and', 'for', 'with', 'from', 'that', 'this'}
+        return [word for word in words if word not in common_stopwords][:10]
 
 
 # doc downloader
@@ -236,11 +222,19 @@ def clean_and_chunk_text(
     logger.info("Processing and chunking of text")
 
     # text cleaning
-    cleaned_text = re.sub(r"\n{3,}", "\n\n", raw_text).strip()
+    cleaned_text = re.sub(r"\n{3,}(?!(--- (Page|Table)))", "\n\n", raw_text).strip()
     cleaned_text = re.sub(r"[ \t]{2,}", " ", cleaned_text)
 
-    # remove excessive spacing, preserve structure
+    # Preserve sentence boundaries after punctuation
     cleaned_text = re.sub(r"([.!?])\s*\n\s*([A-Z])", r"\1\n\n\2", cleaned_text)
+
+    # Protect table markdown structure by temporarily replacing pipes in tables
+    table_pattern = r"(--- Table \d+ on Page \d+ ---.*?)(?=\n\n---|$)"
+    tables = re.findall(table_pattern, cleaned_text, re.DOTALL)
+    table_placeholders = [f"__TABLE_{i}__" for i in range(len(tables))]
+    
+    for i, table in enumerate(tables):
+        cleaned_text = cleaned_text.replace(table, table_placeholders[i])
 
     # text splitter with custom separators for semantic chunking
     text_splitter = RecursiveCharacterTextSplitter(
@@ -248,18 +242,22 @@ def clean_and_chunk_text(
         chunk_overlap=chunk_overlap,
         length_function=len,
         separators=[
-            "\n\n--- Table",  # table boundaries
             "\n\n--- Page",  # page boundaries
-            "\n\n[Section:",  # section boundaries
+            "\n\n--- Table",  # table boundaries (will be restored later)
             "\n\n",  # paragraph breaks
             "\n",  # line breaks
             ". ",  # sentence breaks
             " ",  # word breaks
             "",  # character breaks
         ],
+        keep_separator=True,  # Retain separators in chunks for context
     )
 
     chunks = text_splitter.split_text(cleaned_text)
+
+    # Restore tables in chunks
+    for i, placeholder in enumerate(table_placeholders):
+        chunks = [chunk.replace(placeholder, tables[i]) for chunk in chunks]
 
     if not chunks:
         raise DocumentProcessingError(
@@ -274,25 +272,27 @@ def clean_and_chunk_text(
         page_num = int(page_match.group(1)) if page_match else None
 
         # section
-        section_match = re.search(r"\[Section: ([^\]]+)\]", chunk)
-        section = section_match.group(1) if section_match else "General"
+        section_match = re.search(r"Section: ([^\n]+)", chunk)
+        section = section_match.group(1).strip() if section_match else "General"
 
         # keywords
-        keywords = extract_keywords(chunk)
+        keywords = extract_keywords(chunk, use_spacy=nlp is not None)
 
         # determine chunk type
         chunk_type = "text"
         if "--- Table" in chunk:
             chunk_type = "table"
         elif any(
-            keyword in chunk.lower() for keyword in ["exclusion", "coverage", "benefit"]
+            keyword in chunk.lower() for keyword in ["exclusion", "coverage", "benefit", "claim", "policy"]
         ):
             chunk_type = "policy_rule"
 
-        # importance score (based on keywords and structure)
+        # importance score
         importance_score = 1.0
         if chunk_type == "policy_rule":
             importance_score = 1.5
+        if chunk_type == "table":
+            importance_score = 1.3
         if len(keywords) > 3:
             importance_score *= 1.2
 

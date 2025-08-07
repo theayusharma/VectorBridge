@@ -5,16 +5,18 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "camelot-py>=1.0.0",
     "faiss-cpu>=1.11.0.post1",
     "fastapi>=0.116.1",
     "google-generativeai>=0.8.5",
     "langchain>=0.3.27",
     "langchain-community>=0.3.27",
     "langchain-huggingface>=0.3.1",
-    "pymupdf>=1.26.3",
+    "pdfplumber>=0.11.7",
     "python-docx>=1.2.0",
     "python-dotenv>=1.1.1",
     "sentence-transformers>=5.0.0",
+    "spacy>=3.8.7",
     "textract==1.5",
     "uvicorn>=0.35.0",
 ]

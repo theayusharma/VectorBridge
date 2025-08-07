@@ -3,9 +3,11 @@ import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import dataclass
 
 import docx
-import fitz
+import pdfplumber
+import camelot
 import textract
 
 
@@ -32,22 +34,21 @@ class ChunkMetadata:
         self.importance_score = importance_score
 
 
+@dataclass
 class DocumentStructure:
+    headers: List[Tuple[str, int]]
+    sections: Dict[str, List[str]]
+    tables: List[Dict[str, Any]]
+    key_value_pairs: Dict[str, str]
+
     def __init__(self):
-        self.sections: Dict[str, List[str]] = {}
-        self.headers: List[Tuple[str, int]] = []  # (header_text, level)
-        self.tables: List[Dict[str, Any]] = []
-        self.key_value_pairs: Dict[str, str] = {}
-        self.definitions: Dict[str, str] = {}
-
-
-def do_boxes_intersect(box1: fitz.Rect, box2: fitz.Rect) -> bool:
-    return box1.intersects(box2)
+        self.headers = []
+        self.sections = {}
+        self.tables = []
+        self.key_value_pairs = {}
 
 
 class BaseParser:
-    """Abstraction layer over parsers"""
-
     def parse(
         self, content: io.BytesIO
     ) -> Tuple[str, Dict[str, Any], Optional[DocumentStructure]]:
@@ -58,98 +59,102 @@ class PDFParser(BaseParser):
     def parse(
         self, content: io.BytesIO
     ) -> Tuple[str, Dict[str, Any], DocumentStructure]:
-        full_text_parts = []
-        metadata = {"pages": 0, "tables": 0, "sections": 0, "format": "PDF"}
+        full_text = []
+        metadata = {"pages": 0, "tables": 0, "sections": 0}
         doc_structure = DocumentStructure()
 
         try:
-            doc = fitz.open(stream=content.read(), filetype="pdf")
-            metadata["pages"] = len(doc)
-            current_section = "Introduction"
+            with pdfplumber.open(content) as pdf:
+                metadata["pages"] = len(pdf.pages)
+                current_section = "Introduction"
 
-            for i, page in enumerate(doc):
-                page_tables = list(page.find_tables())
-                table_bboxes = [fitz.Rect(t.bbox) for t in page_tables]
+                # camelot for table extraction
+                content.seek(0)
+                tables = camelot.read_pdf(content, flavor='lattice', pages='all')
 
-                text_blocks = page.get_text("blocks")
-                filtered_text_blocks = []
-                for block in text_blocks:
-                    block_bbox = fitz.Rect(block[:4])
-                    is_in_table = any(
-                        do_boxes_intersect(block_bbox, table_bbox)
-                        for table_bbox in table_bboxes
-                    )
-                    if not is_in_table:
-                        filtered_text_blocks.append(block[4])
+                for i, page in enumerate(pdf.pages):
+                    page_text = page.extract_text(x_tolerance=2) or ""
 
-                page_text = "".join(filtered_text_blocks)
-
-                full_text_parts.append(
-                    f"--- Page {i+1} | Section: {current_section} ---\n{page_text}"
-                )
-
-                lines = page_text.split("\n")
-                for line in lines:
-                    line = line.strip()
-                    if line and (
-                        line.isupper()
-                        or re.match(r"^[A-Z][A-Za-z\s]+:$", line)
-                        or re.match(r"^\d+\.\s+[A-Z]", line)
-                    ):
-                        if line not in [h[0] for h in doc_structure.headers]:
+                    # headers (lines that are likely section headers)
+                    lines = page_text.split("\n")
+                    for line in lines:
+                        line = line.strip()
+                        if line and (
+                            line.isupper()
+                            or re.match(r"^[A-Z][A-Za-z\s]+:$", line)
+                            or re.match(r"^\d+\.\s+[A-Z]", line)
+                        ):
                             doc_structure.headers.append((line, 1))
                             current_section = line
                             metadata["sections"] += 1
 
-                if current_section not in doc_structure.sections:
-                    doc_structure.sections[current_section] = []
-                doc_structure.sections[current_section].append(page_text)
+                    # add to chunks
+                    if current_section not in doc_structure.sections:
+                        doc_structure.sections[current_section] = []
+                    doc_structure.sections[current_section].append(page_text)
 
-                if page_tables:
-                    metadata["tables"] += len(page_tables)
-                    for j, table in enumerate(page_tables):
-                        table_data = table.extract()
-                        if not table_data:
-                            continue
+                    full_text.append(
+                        f"--- Page {i+1} | Section: {current_section} ---\n{page_text}"
+                    )
 
-                        table_metadata = {
-                            "page": i + 1,
-                            "table_id": f"table_{i+1}_{j+1}",
-                            "rows": len(table_data),
-                            "cols": len(table_data[0]) if table_data else 0,
-                        }
-                        doc_structure.tables.append(table_metadata)
+                    # tables (using Camelot)
+                    page_tables = [t for t in tables if t.page == i + 1]
+                    if page_tables:
+                        metadata["tables"] += len(page_tables)
+                        for j, table in enumerate(page_tables):
+                            table_metadata = {
+                                "page": i + 1,
+                                "table_id": f"table_{i+1}_{j+1}",
+                                "rows": table.shape[0],
+                                "cols": table.shape[1],
+                            }
+                            doc_structure.tables.append(table_metadata)
 
-                        if len(table_data) > 1:
-                            headers = table_data[0]
-                            markdown_table = (
-                                "| "
-                                + " | ".join(map(lambda x: str(x or ""), headers))
-                                + " |\n"
-                            )
-                            markdown_table += "|" + "---|" * len(headers) + "\n"
-                            for row in table_data[1:]:
-                                markdown_table += (
+                            # conversion to markdown
+                            df = table.df  # Camelot table as pandas DataFrame
+                            if not df.empty and len(df) > 1:
+                                headers = df.iloc[0].tolist()
+                                # replace newlines and multiple spaces
+                                headers = [
+                                    re.sub(r'\s+', ' ', str(cell).strip()) if cell else ""
+                                    for cell in headers
+                                ]
+                                markdown_table = (
                                     "| "
-                                    + " | ".join(map(lambda x: str(x or ""), row))
+                                    + " | ".join(headers)
                                     + " |\n"
                                 )
+                                markdown_table += "|" + "---|" * len(headers) + "\n"
 
-                            full_text_parts.append(
-                                f"\n--- Table {j+1} on Page {i+1} ---\n{markdown_table}\n"
-                            )
+                                for _, row in df[1:].iterrows():
+                                    # replace newlines and multiple spaces
+                                    cleaned_row = [
+                                        re.sub(r'\s+', ' ', str(cell).strip()) if cell else ""
+                                        for cell in row
+                                    ]
+                                    markdown_table += (
+                                        "| "
+                                        + " | ".join(cleaned_row)
+                                        + " |\n"
+                                    )
 
-                kv_matches = re.findall(r"([A-Z][A-Za-z\s/]+):\s*([^\n]+)", page_text)
-                for key, value in kv_matches:
-                    doc_structure.key_value_pairs[key.strip()] = value.strip()
+                                full_text.append(
+                                    f"\n--- Table {j+1} on Page {i+1} ---\n{markdown_table}\n"
+                                )
+
+                    # key-value pairs
+                    kv_matches = re.findall(r"([A-Z][A-Za-z\s]+):\s*([^\n]+)", page_text)
+                    for key, value in kv_matches:
+                        doc_structure.key_value_pairs[key.strip()] = value.strip()
 
         except Exception as e:
-            raise DocumentProcessingError(f"Failed to parse PDF: {str(e)}") from e
+            raise DocumentProcessingError(f"Failed to parse PDF: {str(e)}")
 
-        full_text = "\n".join(full_text_parts)
-        with open("o.md", "w") as f:
-            f.write(full_text)
-        return full_text, metadata, doc_structure
+        # Write output to markdown
+        # with open("out.md", "w") as f:
+        #     f.write("\n".join(full_text))
+
+        return "\n".join(full_text), metadata, doc_structure
 
 
 class DOCXParser(BaseParser):
