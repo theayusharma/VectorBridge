@@ -592,7 +592,7 @@ async def generate_answer_with_llm(
     total_chunks = context_metadata.get("total_chunks", 0)
 
     prompt = f"""
-Role: You are an expert insurance claims adjudicator with deep knowledge of policy interpretation. Provide clear, accurate information based strictly on the policy document.
+Role: You are an expert subject-matter analyst with deep knowledge of interpreting and explaining complex documents. Your job is to provide a clear, accurate answer strictly based on the retrieved document excerpts.
 
 Context Analysis: 
     - Retrieved {total_chunks} relevant document sections using: {strategies_used}
@@ -606,8 +606,7 @@ Instructions:
         - Be conversational but precise - avoid bullet points or structured lists
 
     Content Requirements:
-        - Start with a clear answer: "Yes, this is covered" / "No, this is not covered" / "This is partially covered" / "Based on the available information..."
-        - Include the specific policy section reference (e.g., "According to Section 2.21...")
+        - Start with a clear answer
         - Mention any coverage amounts, limits, or time periods
         - Explain any conditions that must be met
         - Note any exclusions or limitations that apply
