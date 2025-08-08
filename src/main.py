@@ -3,13 +3,14 @@ import hashlib
 import io
 import json
 import logging
+import joblib
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, cast, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
 import httpx
@@ -19,10 +20,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_community.retrievers import BM25Retriever
+from keybert import KeyBERT
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from pydantic import BaseModel, HttpUrl
+from sentence_transformers import CrossEncoder
 import en_core_web_md
 
 from geminiloadbalance import LLMGenerationError, generate_text_with_retry
@@ -48,8 +52,11 @@ class Config:
     REQUEST_TIMEOUT = 30.0
     CHUNK_SIZE = 800
     CHUNK_OVERLAP = 150
-    TOP_K_CHUNKS = 5
+    TOP_K_CHUNKS = 12
+    RERANK_TOP_K = 8
+    BM25_TOP_K = 8
     EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+    RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-12-v2"
     GEMINI_MODEL = "gemini-2.5-flash"
     MAX_LLM_RETRIES = 3
 
@@ -64,6 +71,7 @@ class Config:
     DOCUMENT_CACHE_DIR = CACHE_DIR / "document"
     VECTORDB_CACHE_DIR = CACHE_DIR / "vectordb"
     METADATA_CACHE_DIR = CACHE_DIR / "metadata"
+    BM25_CACHE_DIR = CACHE_DIR / "bm25"
 
 
 @asynccontextmanager
@@ -72,12 +80,18 @@ async def lifespan(app: FastAPI):
     app.state.embeddings = HuggingFaceEmbeddings(
         model_name=Config.EMBEDDING_MODEL, cache_folder=Config.EMBEDDING_MODEL_PATH
     )
+    logger.info("Loading reranker model...")
+    app.state.reranker = CrossEncoder(Config.RERANKER_MODEL, device="cpu")
+
+    app.state.executor = ThreadPoolExecutor(max_workers=4)
 
     Config.DOCUMENT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     Config.VECTORDB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     Config.METADATA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    Config.BM25_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     yield
     logger.info("Shutting down...")
+    app.state.executor.shutdown(wait=False)
 
 
 try:
@@ -155,8 +169,7 @@ class HackRxResponse(BaseModel):
 def extract_keywords(text: str, use_spacy: bool = True) -> List[str]:
     if use_spacy and nlp:
         doc = nlp(text)
-        # Extract nouns, proper nouns, and significant verbs as keywords
-        keywords = [
+        keywords: List[str] = [
             token.text.lower()
             for token in doc
             if token.pos_ in ["NOUN", "PROPN", "VERB"]
@@ -164,14 +177,14 @@ def extract_keywords(text: str, use_spacy: bool = True) -> List[str]:
             and not token.is_punct
             and len(token.text) > 2
         ]
-        # Remove duplicates while preserving order
-        seen = set()
-        return [k for k in keywords if not (k in seen or seen.add(k))]
     else:
-        # Fallback: simple word-based extraction
-        words = re.findall(r"\b\w{3,}\b", text.lower())
-        common_stopwords = {"the", "and", "for", "with", "from", "that", "this"}
-        return [word for word in words if word not in common_stopwords][:10]
+        kw_model = KeyBERT()
+        keywords = cast(
+            List[str], [kw[0] for kw in kw_model.extract_keywords(text, top_n=10)]
+        )
+
+    seen = set()
+    return [k for k in keywords if not (k in seen or seen.add(k))]
 
 
 # doc downloader
@@ -194,21 +207,29 @@ async def get_document_content_from_url(
                     detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB",
                 )
 
-            response = await client.get(url_str, follow_redirects=True)
-            response.raise_for_status()
+            # stream download
+            buffer = io.BytesIO()
+            async with client.stream("GET", url_str, follow_redirects=True) as response:
+                response.raise_for_status()
 
+                total_bytes = 0
+                async for chunk in response.aiter_bytes(chunk_size=8192):
+                    total_bytes += len(chunk)
+                    if total_bytes > Config.MAX_FILE_SIZE:
+                        raise HTTPException(
+                            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                            detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB",
+                        )
+                    buffer.write(chunk)
+
+            # determine extension
             file_ext = Path(urlparse(url_str).path).suffix.lower()
             if not file_ext or file_ext not in PARSER_MAPPING:
                 file_ext = ".txt"
 
-            content = io.BytesIO(await response.aread())
-            if content.getbuffer().nbytes > Config.MAX_FILE_SIZE:
-                raise HTTPException(
-                    status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                    detail=f"Document exceeds maximum size of {Config.MAX_FILE_SIZE/1024/1024}MB",
-                )
+            buffer.seek(0)
+            return buffer, file_ext
 
-            return content, file_ext
     except httpx.RequestError as e:
         logger.error(f"Failed to download document: {str(e)}")
         raise HTTPException(
@@ -226,11 +247,11 @@ def clean_and_chunk_text(
     logger.info("Processing and chunking of text")
 
     # text cleaning
-    cleaned_text = re.sub(r"\n{3,}(?!(--- (Page|Table)))", "\n\n", raw_text).strip()
+    cleaned_text = re.sub(r"\n{3,}", "\n\n", raw_text).strip()
     cleaned_text = re.sub(r"[ \t]{2,}", " ", cleaned_text)
 
     # Preserve sentence boundaries after punctuation
-    cleaned_text = re.sub(r"([.!?])\s*\n\s*([A-Z])", r"\1\n\n\2", cleaned_text)
+    cleaned_text = re.sub(r"(\d+\.\s+|\-\s+|\*\s+)", r"\n\1", cleaned_text)
 
     # Protect table markdown structure by temporarily replacing pipes in tables
     table_pattern = r"(--- Table \d+ on Page \d+ ---.*?)(?=\n\n---|$)"
@@ -241,23 +262,12 @@ def clean_and_chunk_text(
         cleaned_text = cleaned_text.replace(table, table_placeholders[i])
 
     # text splitter with custom separators for semantic chunking
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        length_function=len,
-        separators=[
-            "\n\n--- Page",  # page boundaries
-            "\n\n--- Table",  # table boundaries (will be restored later)
-            "\n\n",  # paragraph breaks
-            "\n",  # line breaks
-            ". ",  # sentence breaks
-            " ",  # word breaks
-            "",  # character breaks
-        ],
-        keep_separator=True,  # Retain separators in chunks for context
+    text_splitter = SemanticChunker(
+        embeddings=app.state.embeddings,
+        breakpoint_threshold_type="percentile",
+        breakpoint_threshold_amount=95,
     )
-
-    chunks = text_splitter.split_text(cleaned_text)
+    chunks = text_splitter.split_text(raw_text)
 
     # Restore tables in chunks
     for i, placeholder in enumerate(table_placeholders):
@@ -295,11 +305,9 @@ def clean_and_chunk_text(
         # importance score
         importance_score = 1.0
         if chunk_type == "policy_rule":
-            importance_score = 1.5
+            importance_score = 2.0
         if chunk_type == "table":
-            importance_score = 1.3
-        if len(keywords) > 3:
-            importance_score *= 1.2
+            importance_score = 1.5
 
         metadata = ChunkMetadata(
             chunk_id=f"chunk_{i}",
@@ -383,6 +391,29 @@ def load_metadata(
         return {}, None, None
 
 
+def save_bm25_retriever(bm25_retriever: BM25Retriever, doc_hash: str) -> None:
+    try:
+        bm25_cache_path = Config.BM25_CACHE_DIR / f"{doc_hash}.bm25"
+        joblib.dump(bm25_retriever, bm25_cache_path)
+        logger.info(f"Saved BM25 retriever to cache: {bm25_cache_path}")
+    except Exception as e:
+        logger.error(f"Failed to save BM25 retriever: {str(e)}")
+        raise DocumentProcessingError(f"Failed to save BM25 retriever: {str(e)}")
+
+
+def load_bm25_retriever(doc_hash: str) -> Optional[BM25Retriever]:
+    try:
+        bm25_cache_path = Config.BM25_CACHE_DIR / f"{doc_hash}.bm25"
+        if bm25_cache_path.exists():
+            bm25_retriever = joblib.load(bm25_cache_path)
+            logger.info(f"Loaded BM25 retriever from cache: {bm25_cache_path}")
+            return bm25_retriever
+        return None
+    except Exception as e:
+        logger.warning(f"Failed to load BM25 retriever: {str(e)}")
+        return None
+
+
 # vector store creation
 def create_vector_store(
     chunks: List[str],
@@ -424,87 +455,119 @@ def create_vector_store(
 def get_context(
     question: str,
     vector_store: FAISS,
+    bm25_retriever: BM25Retriever,
     top_k: int,
     chunk_metadata: Optional[List[ChunkMetadata]] = None,
 ) -> Tuple[str, Dict[str, Any]]:
     try:
-        # vector search
+        # Vector search (FAISS)
         primary_docs = vector_store.similarity_search(question, k=top_k)
         if not primary_docs:
             logger.warning("No documents found in vector search.")
-            return "", {"primary_chunks": 0, "strategies_used": ["vector_similarity"], "total_chunks": 0}
 
+        # BM25 search
+        bm25_retriever.k = Config.BM25_TOP_K
+        bm25_docs = bm25_retriever.get_relevant_documents(question)
+
+        # Combine and deduplicate
+        combined_docs = primary_docs + [
+            doc
+            for doc in bm25_docs
+            if doc.page_content not in {d.page_content for d in primary_docs}
+        ]
+        if not combined_docs:
+            return "", {
+                "primary_chunks": 0,
+                "bm25_chunks": 0,
+                "strategies_used": ["vector_similarity", "bm25"],
+                "total_chunks": 0,
+            }
+
+        # Reranking
+        query_chunk_pairs = [(question, doc.page_content) for doc in combined_docs]
+        reranker_scores = app.state.reranker.predict(query_chunk_pairs)
+
+        # Combine scores
+        selected_chunks = []
+        for doc, reranker_score in zip(combined_docs, reranker_scores):
+            importance_score = doc.metadata.get("importance_score", 1.0)
+            combined_score = (
+                reranker_score * 0.6
+                + importance_score * 0.3
+                + (0.1 if doc in bm25_docs else 0.0)
+            )
+            selected_chunks.append((doc.page_content, combined_score, doc.metadata))
+
+        # Keyword-based boost
+        seen_chunks = set(chunk[0] for chunk in selected_chunks)
         context_metadata = {
             "primary_chunks": len(primary_docs),
-            "strategies_used": ["vector_similarity"],
+            "bm25_chunks": len(bm25_docs),
+            "strategies_used": ["vector_similarity", "bm25", "reranking"],
             "keyword_matches": 0,
             "expanded_chunks": 0,
             "total_chunks": 0,
         }
-
-        selected_chunks = [
-            (doc.page_content, doc.metadata.get("importance_score", 1.0), doc.metadata)
-            for doc in primary_docs
-        ]
-        seen_chunks = set(chunk[0] for chunk in selected_chunks)  # for deduplication
-
-        # keyword-based boost
         if chunk_metadata:
-            question_keywords = extract_keywords(question.lower(), use_spacy=nlp is not None)
+            question_keywords = extract_keywords(
+                question.lower(), use_spacy=nlp is not None
+            )
             keyword_matches = []
-
             for cm in chunk_metadata:
-                text = cm.text if hasattr(cm, 'text') else None
+                text = cm.text if hasattr(cm, "text") else None
                 if not text:
                     continue
                 text_keywords = [kw.lower() for kw in cm.keywords]
                 overlap = set(text_keywords).intersection(set(question_keywords))
                 if overlap and text not in seen_chunks:
-                    boost_score = len(overlap) * Config.KEYWORD_BOOST_FACTOR * cm.importance_score
+                    boost_score = (
+                        len(overlap) * Config.KEYWORD_BOOST_FACTOR * cm.importance_score
+                    )
                     keyword_matches.append((text, boost_score, cm))
-
             keyword_matches.sort(key=lambda x: x[1], reverse=True)
-            for text, score, cm in keyword_matches[:2]:  # top 2 matches
+            for text, score, cm in keyword_matches[:2]:
                 selected_chunks.append((text, score, cm.__dict__))
                 seen_chunks.add(text)
             context_metadata["keyword_matches"] = len(keyword_matches[:2])
             if keyword_matches:
                 context_metadata["strategies_used"].append("keyword_matching")
 
+        # Context expansion
         expanded_chunks = []
-        primary_indices = [doc.metadata.get("chunk_index", -1) for doc in primary_docs]
-
+        primary_indices = [doc.metadata.get("chunk_index", -1) for doc in combined_docs]
         for idx in primary_indices:
             if idx == -1:
                 continue
-            # previous chunk
             if idx > 0:
                 try:
                     prev_doc = vector_store.similarity_search("", k=idx + 1)[idx - 1]
                     if prev_doc.page_content not in seen_chunks:
-                        expanded_chunks.append((prev_doc.page_content, 0.8, prev_doc.metadata))
+                        expanded_chunks.append(
+                            (prev_doc.page_content, 0.8, prev_doc.metadata)
+                        )
                         seen_chunks.add(prev_doc.page_content)
                 except IndexError:
                     pass
-            # next chunk
             try:
                 next_doc = vector_store.similarity_search("", k=idx + 2)[idx + 1]
                 if next_doc.page_content not in seen_chunks:
-                    expanded_chunks.append((next_doc.page_content, 0.8, next_doc.metadata))
+                    expanded_chunks.append(
+                        (next_doc.page_content, 0.8, next_doc.metadata)
+                    )
                     seen_chunks.add(next_doc.page_content)
             except IndexError:
                 pass
-
         selected_chunks.extend(expanded_chunks[:2])
         context_metadata["expanded_chunks"] = len(expanded_chunks[:2])
         if expanded_chunks:
             context_metadata["strategies_used"].append("context_expansion")
 
-        # sort by score and finalize context
+        # Sort by combined score and select top RERANK_TOP_K
         selected_chunks.sort(key=lambda x: x[1], reverse=True)
+        selected_chunks = selected_chunks[: Config.RERANK_TOP_K]
         context_metadata["total_chunks"] = len(selected_chunks)
 
-        # combine chunks with metadata annotations
+        # Combine chunks with metadata annotations
         context_parts = []
         for i, (chunk_text, score, metadata) in enumerate(selected_chunks):
             chunk_type = metadata.get("chunk_type", "text")
@@ -576,6 +639,7 @@ Required Output: Write a single, comprehensive paragraph that directly answers t
 async def process_questions(
     questions: List[str],
     vector_store: FAISS,
+    bm25_retriever: BM25Retriever,
     top_k: int,
     chunk_metadata: Optional[List[ChunkMetadata]] = None,
 ) -> Tuple[List[str], List[Dict[str, Any]]]:
@@ -583,24 +647,23 @@ async def process_questions(
     tasks = []
     context_metadatas = []
 
-    with ThreadPoolExecutor() as executor:
-        # get context for all questions
-        for question in questions:
-            context, ctx_metadata = await loop.run_in_executor(
-                executor,
-                partial(
-                    get_context,
-                    question,
-                    vector_store,
-                    top_k,
-                    chunk_metadata,
-                ),
-            )
-            context_metadatas.append(ctx_metadata)
-            tasks.append(generate_answer_with_llm(question, context, ctx_metadata))
+    for question in questions:
+        context, ctx_metadata = await loop.run_in_executor(
+            app.state.executor,
+            partial(
+                get_context,
+                question,
+                vector_store,
+                bm25_retriever,
+                top_k,
+                chunk_metadata,
+            ),
+        )
+        context_metadatas.append(ctx_metadata)
+        tasks.append(generate_answer_with_llm(question, context, ctx_metadata))
 
-        answers = await asyncio.gather(*tasks)
-        return answers, context_metadatas
+    answers = await asyncio.gather(*tasks)
+    return answers, context_metadatas
 
 
 # API endpoints
@@ -620,23 +683,23 @@ async def hackrx_run(
         doc_hash = get_document_hash(content_bytes.getvalue())
         vector_store_path = Config.VECTORDB_CACHE_DIR / f"{doc_hash}.faiss"
 
-        # cache check
+        # Cache check
+        vector_store = None
+        bm25_retriever = None
         if vector_store_path.exists():
             logger.info(f"Loading vector store from cache: {vector_store_path}")
             vector_store = FAISS.load_local(
                 folder_path=str(Config.VECTORDB_CACHE_DIR),
                 index_name=doc_hash,
                 embeddings=app.state.embeddings,
-                allow_dangerous_deserialization=True,
+                # allow_dangerous_deserialization=True,
             )
-
-            # load metadata
+            bm25_retriever = load_bm25_retriever(doc_hash)
             metadata, doc_structure, chunk_metadata = load_metadata(doc_hash)
             if not metadata:
                 metadata = {"source": "cache"}
         else:
             logger.info("Processing new document.")
-
             parser = PARSER_MAPPING.get(file_ext)
             if not parser:
                 raise HTTPException(
@@ -649,7 +712,7 @@ async def hackrx_run(
                 metadata,
                 doc_structure,
             ) = await asyncio.get_event_loop().run_in_executor(
-                None, parser.parse, io.BytesIO(content_bytes.getvalue())
+                app.state.executor, parser.parse, io.BytesIO(content_bytes.getvalue())
             )
 
             text_chunks, chunk_metadata = clean_and_chunk_text(
@@ -657,66 +720,85 @@ async def hackrx_run(
             )
 
             vector_store = await asyncio.get_event_loop().run_in_executor(
-                None,
+                app.state.executor,
                 create_vector_store,
                 text_chunks,
                 app.state.embeddings,
                 chunk_metadata,
             )
 
-            # save to cache
+            # Create BM25 retriever
+            bm25_retriever = BM25Retriever.from_texts(
+                text_chunks,
+                metadatas=[
+                    {
+                        "chunk_index": i,
+                        "chunk_id": cm.chunk_id,
+                        "page_num": cm.page_num,
+                        "section": cm.section,
+                        "keywords": cm.keywords,
+                        "chunk_type": cm.chunk_type,
+                        "importance_score": cm.importance_score,
+                    }
+                    for i, cm in enumerate(chunk_metadata)
+                ],
+            )
+
+            # Save to cache
             vector_store.save_local(
                 folder_path=str(Config.VECTORDB_CACHE_DIR), index_name=doc_hash
             )
+            save_bm25_retriever(bm25_retriever, doc_hash)
             save_metadata(doc_hash, metadata, doc_structure, chunk_metadata)
 
             with open(Config.DOCUMENT_CACHE_DIR / doc_hash, "wb") as f:
                 f.write(content_bytes.getvalue())
             logger.info(
-                f"Saved new document and vector store to cache with hash: {doc_hash}"
+                f"Saved new document, vector store, and BM25 retriever to cache with hash: {doc_hash}"
             )
 
-        if chunk_metadata:
-            # process questions with context retrieval
-            answers, context_metadatas = await process_questions(
-                req.questions,
-                vector_store,
-                Config.TOP_K_CHUNKS,
-                chunk_metadata,
+        if not vector_store or not bm25_retriever:
+            raise DocumentProcessingError(
+                "Failed to load or create vector store or BM25 retriever"
             )
 
-            # mesh it up
-            aggregated_context_metadata = {
-                "total_questions": len(req.questions),
-                "average_chunks_per_question": sum(
-                    cm.get("total_chunks", 0) for cm in context_metadatas
+        # Process questions with context retrieval
+        answers, context_metadatas = await process_questions(
+            req.questions,
+            vector_store,
+            bm25_retriever,  # Pass BM25 retriever
+            Config.TOP_K_CHUNKS,
+            chunk_metadata,
+        )
+
+        # Aggregate context metadata
+        aggregated_context_metadata = {
+            "total_questions": len(req.questions),
+            "average_chunks_per_question": (
+                sum(cm.get("total_chunks", 0) for cm in context_metadatas)
+                / len(context_metadatas)
+                if context_metadatas
+                else 0
+            ),
+            "strategies_summary": {
+                strategy: sum(
+                    1
+                    for cm in context_metadatas
+                    if strategy in cm.get("strategies_used", [])
                 )
-                / len(context_metadatas),
-                "strategies_summary": {
-                    strategy: sum(
-                        1
-                        for cm in context_metadatas
-                        if strategy in cm.get("strategies_used", [])
-                    )
-                    for strategy in [
-                        "vector_similarity",
-                        "keyword_matching",
-                        "context_expansion",
-                    ]
-                },
-            }
-        else:
-            answers = await process_questions(
-                req.questions, vector_store, Config.TOP_K_CHUNKS, None
-            )
-            aggregated_context_metadata = {
-                "total_questions": len(req.questions),
-                "processing_mode": "standard",
-            }
+                for strategy in [
+                    "vector_similarity",
+                    "bm25",
+                    "reranking",
+                    "keyword_matching",
+                    "context_expansion",
+                ]
+            },
+        }
 
         processing_time = asyncio.get_event_loop().time() - start_time
 
-        # metadata for response
+        # Metadata for response
         response_metadata = metadata.copy()
         if doc_structure:
             doc_struct_data = {
@@ -727,23 +809,25 @@ async def hackrx_run(
                     "key_value_pairs": len(doc_structure.key_value_pairs),
                 }
             }
-            response_metadata.update(doc_struct_data)  # type: ignore
+            response_metadata.update(doc_struct_data)  # type:ignore
 
         if chunk_metadata:
             chunk_types = {}
             for cm in chunk_metadata:
                 chunk_types[cm.chunk_type] = chunk_types.get(cm.chunk_type, 0) + 1
-            response_metadata["chunk_analysis"] = {  # type: ignore
+            response_metadata["chunk_analysis"] = {  # type:ignore
                 "total_chunks": len(chunk_metadata),
                 "chunk_types": chunk_types,
-                "avg_importance_score": sum(
-                    cm.importance_score for cm in chunk_metadata
-                )
-                / len(chunk_metadata),
+                "avg_importance_score": (
+                    sum(cm.importance_score for cm in chunk_metadata)
+                    / len(chunk_metadata)
+                    if chunk_metadata
+                    else 0
+                ),
             }
 
         return HackRxResponse(
-            answers=answers,  # type: ignore
+            answers=answers,
             processing_time=round(processing_time, 2),
             document_metadata=response_metadata,
             context_metadata=aggregated_context_metadata,

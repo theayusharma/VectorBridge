@@ -16,6 +16,7 @@ class DocumentProcessingError(Exception):
 
 
 # data structures
+@dataclass
 class ChunkMetadata:
     def __init__(
         self,
@@ -25,6 +26,7 @@ class ChunkMetadata:
         keywords: Optional[List[str]] = None,
         chunk_type: str = "text",
         importance_score: float = 1.0,
+        text: Optional[str] = None
     ):
         self.chunk_id = chunk_id
         self.page_num = page_num
@@ -32,6 +34,7 @@ class ChunkMetadata:
         self.keywords = keywords or []
         self.chunk_type = chunk_type
         self.importance_score = importance_score
+        self.text = text
 
 
 @dataclass
