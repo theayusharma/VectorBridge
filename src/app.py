@@ -15,6 +15,7 @@ from langchain_community.retrievers import BM25Retriever
 from prometheus_fastapi_instrumentator import Instrumentator
 from pydantic import BaseModel
 
+from cache import CacheManager
 from chunker import DocumentChunker
 from config import Config
 from doc_downloader import DocumentDownloader
@@ -76,7 +77,7 @@ async def lifespan(app: FastAPI):
         parsers=PARSER_MAPPING,
         max_workers=4,
         max_file_size=config.MAX_FILE_SIZE,
-        timeout=120.0,
+        timeout=600.0,
     )
 
     app.state.chunker = DocumentChunker(
@@ -85,6 +86,8 @@ async def lifespan(app: FastAPI):
         semantic_threshold=config.SEMANTIC_SIMILARITY_THRESHOLD,
         embeddings=config.embeddings,
     )
+
+    app.state.processing_cache = CacheManager(cache_dir=config.CACHE_DIR)
 
     app.state.vector_mgr = VectorStoreManager(
         embeddings=config.embeddings,
@@ -104,7 +107,9 @@ async def lifespan(app: FastAPI):
 
 
 # FastAPI app
-app = FastAPI(title="HackRx RAG API", version="0.2.0", lifespan=lifespan)
+app = FastAPI(title="HackRx RAG API", version="0.2.2", lifespan=lifespan)
+
+Instrumentator().instrument(app).expose(app)
 
 # Middleware
 app.add_middleware(
@@ -114,12 +119,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-if os.getenv("ENVIRONMENT") == "production":
-    from fastapi.middleware.httpsredirect import HTTPSRedirectMiddleware
-    app.add_middleware(HTTPSRedirectMiddleware)
-
-Instrumentator().instrument(app).expose(app)
-
 
 # API endpoints
 @app.post("/hackrx/run", response_model=List[str])
@@ -127,30 +126,42 @@ async def process_document(
     request: DocumentRequest, _api_key: str = Depends(validate_api_key)
 ):
     try:
-        # Step 1: Download and parse document
+        # Step 1: Download document and calculate hash
         raw_content, file_ext = await app.state.downloader.download(request.documents)
         doc_hash = hashlib.sha256(raw_content.getvalue()).hexdigest()
 
-        # Step 2: Parse document
-        raw_text, _metadata, _doc_structure = await app.state.parser.parse(
-            raw_content, file_ext
-        )
+        # Step 2: Check cache for processed (chunked) document
+        cached_data = app.state.processing_cache.load(doc_hash)
 
-        # Step 3: Chunk document
-        chunks, chunk_metadata = app.state.chunker.chunk(raw_text)
+        if cached_data:
+            chunks, chunk_metadata = cached_data
+            logger.info(
+                f"Loaded {len(chunks)} chunks from cache for doc_hash: {doc_hash}"
+            )
+        else:
+            # Step 2a: If not in cache, parse the document
+            logger.info(f"Parsing document (hash: {doc_hash})")
+            raw_text, _, _ = await app.state.parser.parse(raw_content, file_ext)
 
-        # Create BM25 retriever for this document
+            # Step 2b: Chunk the raw text
+            logger.info(f"Chunking document (hash: {doc_hash})")
+            chunks, chunk_metadata = app.state.chunker.chunk(raw_text)
+
+            # Step 2c: Save the results to the new processing cache
+            app.state.processing_cache.save(doc_hash, chunks, chunk_metadata)
+
+        # Step 3: Create BM25 retriever for this document
         bm25_retriever = BM25Retriever.from_texts(texts=chunks)
 
-        # Step 4: Create vector store
-        vector_store, _vs_metadata = app.state.vector_mgr.create_vector_store(
+        # Step 4: Create/load vector store (this has its own separate cache)
+        vector_store, _ = app.state.vector_mgr.create_vector_store(
             chunks=chunks,
             chunk_metadata=[cm.__dict__ for cm in chunk_metadata],
             doc_hash=doc_hash,
         )
 
-        # Step 5: Process questions
-        results, _context_metadatas = await app.state.processor.process_questions(
+        # Step 5: Process questions using the retrieved and chunked data
+        results, _ = await app.state.processor.process_questions(
             questions=request.questions,
             vector_store=vector_store,
             bm25_retriever=bm25_retriever,
@@ -187,12 +198,18 @@ async def health_check(request: Request):
 
 
 @app.post("/cache/purge")
-async def purge_cache(request: Request, documents: str, _api_key: str = Depends(validate_api_key)):
-    """Purge cached embeddings for a document"""
+async def purge_cache(
+    request: Request, documents: str, _api_key: str = Depends(validate_api_key)
+):
+    """Purge all cached data for a document."""
     try:
         content, _ = await request.app.state.downloader.download(documents)
         doc_hash = hashlib.sha256(content.getvalue()).hexdigest()
+
+        # Purge from both the vector store and the processing cache
         request.app.state.vector_mgr.purge_document(doc_hash)
+        request.app.state.processing_cache.purge(doc_hash)
+
         return {"status": "purged", "doc_hash": doc_hash}
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import io
 import logging
 import os
@@ -8,7 +9,7 @@ from abc import abstractmethod
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import camelot
 import docx
@@ -45,90 +46,55 @@ class BaseParser:
 
 
 class PDFParser(BaseParser):
-    def __init__(self):
-        self._parser_lock = Lock()
+    def __init__(self, max_table_workers: int = 4):
+        super().__init__()
+        self.max_table_workers = max_table_workers
+        self._camelot_lock = Lock()
 
-    def parse(
-        self, content: io.BytesIO
-    ) -> Tuple[str, Dict[str, Any], DocumentStructure]:
+    def parse(self, content: io.BytesIO) -> Tuple[str, Dict[str, Any], DocumentStructure]:
         working_copy = io.BytesIO(content.getvalue())
-
         full_text = []
         metadata = {"pages": 0, "tables": 0, "sections": 0}
         doc_structure = DocumentStructure()
 
         try:
-            with self._parser_lock:
-                # First pass - extract basic structure and text
-                with pdfplumber.open(working_copy) as pdf:
-                    metadata["pages"] = len(pdf.pages)
-                    current_section = "Introduction"
-                    section_text = []
-
-                    for i, page in enumerate(pdf.pages):
-                        try:
-                            page_text = (
-                                page.extract_text(x_tolerance=2, y_tolerance=2) or ""
-                            )
-                            lines = page_text.split("\n")
-
-                            for line in lines:
-                                line = line.strip()
-                                if self._is_header(line):
-                                    header_level = self._determine_header_level(line)
-                                    doc_structure.headers.append((line, header_level))
-                                    current_section = line
-                                    metadata["sections"] += 1
-                                    # flush previous section content
-                                    if section_text:
-                                        doc_structure.sections[current_section] = (
-                                            section_text
-                                        )
-                                        section_text = []
-
-                            section_text.append(page_text)
-                            full_text.append(
-                                f"--- Page {i+1} | Section: {current_section} ---\n{page_text}"
-                            )
-
-                            # key-value pairs
-                            self._extract_key_value_pairs(page_text, doc_structure)
-
-                        except Exception as page_error:
-                            logger.error(
-                                f"Error processing page {i+1}: {str(page_error)}"
-                            )
-                            continue
-
-                    # add final section
-                    if section_text:
-                        doc_structure.sections[current_section] = section_text
-
-                # second pass - tables only
-                working_copy.seek(0)
-                try:
-                    tables = camelot.read_pdf(
-                        working_copy,
-                        flavor="lattice",
-                        pages="all",
-                        suppress_stdout=True,
-                        process_background=True,
+            # First pass - identify pages with potential tables
+            with pdfplumber.open(working_copy) as pdf:
+                metadata["pages"] = len(pdf.pages)
+                table_pages = self._identify_table_pages(pdf)
+                
+                # Process text content sequentially
+                current_section = "Introduction"
+                section_text = []
+                
+                for i, page in enumerate(pdf.pages):
+                    page_text = page.extract_text(x_tolerance=2, y_tolerance=2) or ""
+                    self._process_page_content(
+                        page_text, i, doc_structure, metadata, 
+                        full_text, current_section, section_text
                     )
-                    metadata["tables"] = len(tables)
-                    self._process_tables(tables, full_text, doc_structure)
-                except Exception as table_error:
-                    logger.error(f"Table extraction failed: {str(table_error)}")
 
-            with open("out.md", "w") as f:
-                f.write("\n".join(full_text))
+            # Parallel table extraction
+            if table_pages:
+                working_copy.seek(0)
+                tables = self._parallel_table_extraction(working_copy, table_pages)
+                metadata["tables"] = len(tables)
+                self._process_tables(tables, full_text, doc_structure)
+
             return "\n".join(full_text), metadata, doc_structure
 
-        except pdfplumber.PDFSyntaxError as e:
-            raise DocumentProcessingError(f"Invalid PDF structure: {e}") from e
         except Exception as e:
             raise DocumentProcessingError(f"PDF processing failed: {str(e)}")
         finally:
             working_copy.close()
+
+    def _identify_table_pages(self, pdf) -> Set[int]:
+        """Identify pages likely containing tables"""
+        table_pages = set()
+        for i, page in enumerate(pdf.pages):
+            if self._page_likely_has_tables(page):
+                table_pages.add(i + 1)  # Camelot uses 1-based page numbers
+        return table_pages
 
     def _is_header(self, text: str) -> bool:
         """Improved header detection logic"""
@@ -152,6 +118,33 @@ class PDFParser(BaseParser):
         if re.match(r"^\d+\.", text):
             return 2
         return 3  # Default level
+    def _process_page_content(self, page_text: str, page_num: int, doc_structure: DocumentStructure,
+                             metadata: Dict[str, Any], full_text: List[str],
+                             current_section: str, section_text: List[str]) -> str:
+        """Process the content of a single page and update document structure"""
+        lines = page_text.split("\n")
+        
+        for line in lines:
+            line = line.strip()
+            if self._is_header(line):
+                header_level = self._determine_header_level(line)
+                doc_structure.headers.append((line, header_level))
+                current_section = line
+                metadata["sections"] += 1
+                # Flush previous section content
+                if section_text:
+                    doc_structure.sections[current_section] = section_text
+                    section_text = []
+    
+        section_text.append(page_text)
+        full_text.append(
+            f"--- Page {page_num+1} | Section: {current_section} ---\n{page_text}"
+        )
+        
+        # Extract key-value pairs
+        self._extract_key_value_pairs(page_text, doc_structure)
+        
+        return current_section
 
     def _extract_key_value_pairs(self, text: str, doc_structure: DocumentStructure):
         """Extract key: value pairs from text"""
@@ -162,10 +155,60 @@ class PDFParser(BaseParser):
             if clean_key and clean_value:
                 doc_structure.key_value_pairs[clean_key] = clean_value
 
+    def _parallel_table_extraction(self, pdf_stream: io.BytesIO, pages: Set[int]) -> List[Any]:
+        """Extract tables from multiple pages in parallel"""
+        tables = []
+        page_numbers = list(pages)
+        
+        # We process pages in chunks to balance memory usage
+        chunk_size = max(1, len(page_numbers) // self.max_table_workers)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_table_workers) as executor:
+            futures = []
+            
+            for i in range(0, len(page_numbers), chunk_size):
+                chunk = page_numbers[i:i + chunk_size]
+                futures.append(
+                    executor.submit(
+                        self._extract_tables_chunk,
+                        pdf_stream.getvalue(),  # Pass raw bytes to avoid thread issues
+                        chunk
+                    )
+                )
+            
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    tables.extend(future.result())
+                except Exception as e:
+                    logger.error(f"Table extraction failed for chunk: {str(e)}")
+        
+        return tables
+
+    def _extract_tables_chunk(self, pdf_bytes: bytes, pages: List[int]) -> List[Any]:
+        """Process a chunk of pages (runs in worker thread)"""
+        chunk_tables = []
+        pdf_stream = io.BytesIO(pdf_bytes)
+        
+        try:
+            # Camelot isn't thread-safe, so we need to lock
+            with self._camelot_lock:
+                tables = camelot.read_pdf(
+                    pdf_stream,
+                    flavor="lattice",
+                    pages=",".join(map(str, pages)),
+                    suppress_stdout=True,
+                    process_background=True
+                )
+                chunk_tables.extend(tables)
+        finally:
+            pdf_stream.close()
+        
+        return chunk_tables
+
     def _process_tables(self, tables, full_text, doc_structure):
         """Process extracted tables into structured format"""
         for table in tables:
-            if table.shape[0] <= 1:  # Skip empty/single-row tables
+            if table.shape[0] <= 1:
                 continue
 
             table_metadata = {
@@ -202,6 +245,31 @@ class PDFParser(BaseParser):
         if not text or not isinstance(text, str):
             return ""
         return re.sub(r"\s+", " ", str(text).strip())
+
+
+    def _page_likely_has_tables(self, page: pdfplumber.page) -> bool:
+        """Heuristic to determine if a page likely contains tables"""
+        # Check for common table indicators
+        text = page.extract_text() or ""
+        
+        # 1. Look for dense text areas with alignment patterns
+        words = page.extract_words()
+        if len(words) > 50:  # Dense text
+            x_coords = [w['x0'] for w in words]
+            # Check for alignment patterns (common in tables)
+            if len(set(round(x) for x in x_coords)) < len(x_coords)/3:
+                return True
+        
+        # 2. Look for common table headers/footers
+        table_keywords = ["table", "tab.", "figure", "no.", "item", "description", "qty", "amount"]
+        if any(keyword in text.lower() for keyword in table_keywords):
+            return True
+        
+        # 3. Look for grid-like structures
+        if len(page.rect_edges) > 10:  # Lots of rectangles
+            return True
+        
+        return False
 
 
 class DOCXParser(BaseParser):
