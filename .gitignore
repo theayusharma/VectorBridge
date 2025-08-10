@@ -2,6 +2,6 @@
 models/
 .venv/
 cache/
+.cache/
 __pycache__/
-api_logs.txt
-api_hit_count.txt
+*.log

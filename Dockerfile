@@ -13,4 +13,4 @@ ENV PORT=8080
 ENV ENVIRONMENT="production"
 EXPOSE $PORT
 
-CMD ["uv", "run", "src/main.py"]
+CMD ["uv", "run", "src/app.py"]
